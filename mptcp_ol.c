@@ -20,6 +20,8 @@
 #include <linux/module.h>
 #include <net/mptcp.h>
 
+#define OLSCHED_SCALE 8
+
 /* Struct to store the data of a single subflow */
 struct olsched_priv {
 	/* The skb or NULL */
@@ -29,9 +31,9 @@ struct olsched_priv {
 	 */
 	u32 skb_end_seq;
 
-	u16 red_quota; // ytxing: how many redundant pkts should this subflow send
-	u16 red_quota2; // ytxing: how many redundant pkts should this subflow send
-	u16 red_quota3; // ytxing: how many redundant pkts should this subflow send
+	__u16 red_quota; // ytxing: how many redundant pkts should this subflow send
+	__u16 new_quota; // ytxing: how many new pkts should this subflow send
+	__u8  red_ratio; // ytxing: (0, 255), multiply and >> OLSCHED_SCALE
 };
 
 /* Struct to store the data of the control block */
@@ -197,6 +199,61 @@ static void olsched_correct_skb_pointers(struct sock *meta_sk,
 		ol_p->skb = NULL;
 }
 
+/*	ytxing: get a bettersk that satisfies: 
+ *			bestsk->srtt < bettersk->srtt <= others->srtt,
+ *			if bestsk == NULL, then it simply returns the sk with min rtt.
+ *			Should check if this sk can send a skb later. */
+static struct sock *get_shorter_rtt_subflow_with_selector(struct mptcp_cb *mpcb, 
+						struct sock *bestsk, 
+						bool (*selector)(const struct tcp_sock *))
+{
+	struct sock *bettersk = NULL;
+	u32 better_srtt = 0xffffffff;
+	u32 best_srtt = 0;
+	struct mptcp_tcp_sock *mptcp;
+
+	if (bestsk)
+		best_srtt = tcp_sk(bestsk)->srtt_us;
+
+	mptcp_for_each_sub(mpcb, mptcp) {
+		struct sock *sk = mptcp_to_sock(mptcp);
+		struct tcp_sock *tp = tcp_sk(sk);
+
+		/* First, we choose only the wanted sks */
+		if (!(*selector)(tp))
+			continue;
+
+		if (mptcp_is_def_unavailable(sk))
+			continue;
+
+		if (tp->srtt_us <= best_srtt && bestsk)
+			continue;
+
+		if (tp->srtt_us < better_srtt) {
+			better_srtt = tp->srtt_us;
+			bettersk = sk;
+		}
+	}
+
+	return bettersk;
+}
+
+/* ytxing:	calculate the redundant quota of this subflow 
+ *			e.g., how many redundant should it send
+ */
+static void olsched_check_quota(struct mptcp_tcp_sock *mptcp,
+					  struct olsched_priv *ol_p)
+{
+	struct tcp_sock *tp = mptcp->tp;
+	// still has quota, no need to calculate again
+	if (ol_p->red_quota > 0 || ol_p->new_quota > 0)
+		return;
+
+	ol_p->red_quota =  (tp->snd_cwnd * ol_p->red_ratio) >> OLSCHED_SCALE;
+	ol_p->new_quota = tp->snd_cwnd - ol_p->red_quota;
+}
+
+
 /* Returns the next skb from the queue */
 static struct sk_buff *olsched_next_skb_from_queue(struct sk_buff_head *queue,
 						    struct sk_buff *previous,
@@ -354,7 +411,7 @@ static struct sk_buff *mptcp_ol_next_segment(struct sock *meta_sk,
 
 // ytxing: 	1. find a subflow with minimal RTT;
 //			2. get a redundant or normal skb for the subflow
-static struct sk_buff *mptcp_ol_next_segment_mine(struct sock *meta_sk,
+static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 					      int *reinject,
 					      struct sock **subsk,
 					      unsigned int *limit)
@@ -362,11 +419,14 @@ static struct sk_buff *mptcp_ol_next_segment_mine(struct sock *meta_sk,
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
 	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
-	struct tcp_sock *first_tp = ol_cb->next_subflow, *tp;
+	struct olsched_priv *ol_p;
+	struct tcp_sock *tp;
 	struct mptcp_tcp_sock *mptcp;
 	int active_valid_sks = -1;
 	struct sk_buff *skb;
-	int found = 0;
+	struct sock *sk, *unavailable_sk;
+	// int found = 0;
+	int i = 0;
 
 	/* As we set it, we have to reset it as well. */
 	*limit = 0;
@@ -389,82 +449,56 @@ static struct sk_buff *mptcp_ol_next_segment_mine(struct sock *meta_sk,
 
 	/* Then try indistinctly redundant and normal skbs */
 
-	// if (!first_tp && !hlist_empty(&mpcb->conn_list)) {
-	// 	first_tp = hlist_entry_safe(rcu_dereference_raw(hlist_first_rcu(&mpcb->conn_list)),
-	// 				    struct mptcp_tcp_sock, node)->tp;
-	// }
-
-	/* still NULL (no subflow in conn_list?) */
-	// if (!first_tp)
-	// 	return NULL;
-
-	// tp = first_tp;
-
 	*reinject = 0;
 	active_valid_sks = olsched_get_active_valid_sks(meta_sk);
 
-	/* We want to pick a subflow that is after 'first_tp' in the list of subflows.
-	 * Thus, the first mptcp_for_each_sub()-loop tries to walk the list up
-	 * to the subflow 'tp' and then checks whether any one of the remaining
-	 * ones can send a segment.
-	 * The second mptcp_for_each-sub()-loop is then iterating from the
-	 * beginning of the list up to 'first_tp'.
-	 */
-	mptcp_for_each_sub(mpcb, mptcp) {
-		struct olsched_priv *ol_p;
-
-		if (tp == mptcp->tp)
-			found = 1;
-
-		if (!found)
-			continue;
-
-		tp = mptcp->tp;
-
-		/* Correct the skb pointers of the current subflow */
-		ol_p = olsched_get_priv(tp);
-		olsched_correct_skb_pointers(meta_sk, ol_p);
-
-		skb = olsched_next_skb_from_queue(&meta_sk->sk_write_queue,
-						   ol_p->skb, meta_sk);
-		if (skb && olsched_use_subflow(meta_sk, active_valid_sks, tp,
-						skb)) {
-			ol_p->skb = skb;
-			ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
-			olsched_update_next_subflow(tp, ol_cb);
-			*subsk = (struct sock *)tp;
-
-			if (TCP_SKB_CB(skb)->path_mask)
-				*reinject = -1;
-			return skb;
-		}
-	}
-
-	mptcp_for_each_sub(mpcb, mptcp) {
-		struct olsched_priv *ol_p;
-
-		tp = mptcp->tp;
-
-		if (tp == first_tp)
+	unavailable_sk = NULL;
+	/* ytxing: in this loop we find a avaliable sk with rtt as short as possible*/
+	for(i; i < active_valid_sks; i++){
+		sk = get_shorter_rtt_subflow_with_selector(mpcb, unavailable_sk ,&subflow_is_active);
+		tp = tcp_sk(sk);
+		if (!tp)
 			break;
-
-		/* Correct the skb pointers of the current subflow */
 		ol_p = olsched_get_priv(tp);
 		olsched_correct_skb_pointers(meta_sk, ol_p);
+		olsched_check_quota(mptcp, ol_p); // ytxing
 
-		skb = olsched_next_skb_from_queue(&meta_sk->sk_write_queue,
-						   ol_p->skb, meta_sk);
-		if (skb && olsched_use_subflow(meta_sk, active_valid_sks, tp,
-						skb)) {
-			ol_p->skb = skb;
-			ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
-			olsched_update_next_subflow(tp, ol_cb);
-			*subsk = (struct sock *)tp;
-
-			if (TCP_SKB_CB(skb)->path_mask)
-				*reinject = -1;
-			return skb;
+		if (ol_p->red_quota >= 1){ // Executing redundant routines
+			skb = olsched_next_skb_from_queue(&meta_sk->sk_write_queue,
+								ol_p->skb, meta_sk);
+		
+			if (skb && olsched_use_subflow(meta_sk, active_valid_sks, tp,
+							skb)) {
+				ol_p->skb = skb;
+				ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
+				olsched_update_next_subflow(tp, ol_cb);
+				*subsk = (struct sock *)tp;
+				printk(KERN_INFO "ytxing skb_len %u (mss?)\n", skb->len);
+				ol_p->red_quota -= 1;
+				if (TCP_SKB_CB(skb)->path_mask)
+					*reinject = -1;
+				return skb;
+			}
 		}
+		else { // send a new skb, no need redundant
+			skb = tcp_send_head(meta_sk);
+			if (skb && olsched_use_subflow(meta_sk, active_valid_sks, tp,
+							skb)) {
+				ol_p->skb = skb;
+				ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
+				olsched_update_next_subflow(tp, ol_cb);
+				*subsk = (struct sock *)tp;
+				printk(KERN_INFO "ytxing skb_len %u (mss?)\n", skb->len);
+				ol_p->new_quota -= 1;
+				if (TCP_SKB_CB(skb)->path_mask)
+					*reinject = -1;
+				return skb;
+			}
+		}
+
+		// ytxing: 	now this sk is unable to send (maybe cwnd limited)
+		//			to a sk with longer rtt.
+		unavailable_sk = sk;
 	}
 
 	/* Nothing to send */
@@ -483,9 +517,21 @@ static void olsched_release(struct sock *sk)
 		olsched_update_next_subflow(tp, ol_cb);
 }
 
+static void olsched_init(struct sock *sk)
+{
+	struct olsched_priv *ol_p = olsched_get_priv(tcp_sk(sk));
+	struct olsched_cb *ol_cb = olsched_get_cb(tcp_sk(mptcp_meta_sk(sk)));
+
+	ol_p->red_ratio = 0xFF;
+
+	if(ol_cb->next_subflow == NULL)
+		ol_cb->next_subflow = NULL; //ytxing: nothing...
+}
+
 static struct mptcp_sched_ops mptcp_sched_ol = {
 	.get_subflow = ol_get_available_subflow,
 	.next_segment = mptcp_ol_next_segment,
+	.init = olsched_init,
 	.release = olsched_release,
 	.name = "ol",
 	.owner = THIS_MODULE,
