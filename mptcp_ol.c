@@ -21,34 +21,38 @@
 #include <net/mptcp.h>
 
 /* Struct to store the data of a single subflow */
-struct redsched_priv {
+struct olsched_priv {
 	/* The skb or NULL */
 	struct sk_buff *skb;
 	/* End sequence number of the skb. This number should be checked
 	 * to be valid before the skb field is used
 	 */
 	u32 skb_end_seq;
+
+	u16 red_quota; // ytxing: how many redundant pkts should this subflow send
+	u16 red_quota2; // ytxing: how many redundant pkts should this subflow send
+	u16 red_quota3; // ytxing: how many redundant pkts should this subflow send
 };
 
 /* Struct to store the data of the control block */
-struct redsched_cb {
+struct olsched_cb {
 	/* The next subflow where a skb should be sent or NULL */
 	struct tcp_sock *next_subflow;
 };
 
 /* Returns the socket data from a given subflow socket */
-static struct redsched_priv *redsched_get_priv(struct tcp_sock *tp)
+static struct olsched_priv *olsched_get_priv(struct tcp_sock *tp)
 {
-	return (struct redsched_priv *)&tp->mptcp->mptcp_sched[0];
+	return (struct olsched_priv *)&tp->mptcp->mptcp_sched[0];
 }
 
 /* Returns the control block data from a given meta socket */
-static struct redsched_cb *redsched_get_cb(struct tcp_sock *tp)
+static struct olsched_cb *olsched_get_cb(struct tcp_sock *tp)
 {
-	return (struct redsched_cb *)&tp->mpcb->mptcp_sched[0];
+	return (struct olsched_cb *)&tp->mpcb->mptcp_sched[0];
 }
 
-static bool redsched_get_active_valid_sks(struct sock *meta_sk)
+static bool olsched_get_active_valid_sks(struct sock *meta_sk)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
@@ -66,7 +70,7 @@ static bool redsched_get_active_valid_sks(struct sock *meta_sk)
 	return active_valid_sks;
 }
 
-static bool redsched_use_subflow(struct sock *meta_sk,
+static bool olsched_use_subflow(struct sock *meta_sk,
 				 int active_valid_sks,
 				 struct tcp_sock *tp,
 				 struct sk_buff *skb)
@@ -79,7 +83,7 @@ static bool redsched_use_subflow(struct sock *meta_sk,
 
 	if (TCP_SKB_CB(skb)->path_mask == 0) {
 		if (active_valid_sks == -1)
-			active_valid_sks = redsched_get_active_valid_sks(meta_sk);
+			active_valid_sks = olsched_get_active_valid_sks(meta_sk);
 
 		if (subflow_is_backup(tp) && active_valid_sks > 0)
 			return false;
@@ -94,25 +98,25 @@ static bool redsched_use_subflow(struct sock *meta_sk,
 	hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(			\
 		&(__mptcp)->node)), struct mptcp_tcp_sock, node)
 
-static void redsched_update_next_subflow(struct tcp_sock *tp,
-					 struct redsched_cb *red_cb)
+static void olsched_update_next_subflow(struct tcp_sock *tp,
+					 struct olsched_cb *ol_cb)
 {
 	struct mptcp_tcp_sock *mptcp = mptcp_entry_next_rcu(tp->mptcp);
 
 	if (mptcp)
-		red_cb->next_subflow = mptcp->tp;
+		ol_cb->next_subflow = mptcp->tp;
 	else
-		red_cb->next_subflow = NULL;
+		ol_cb->next_subflow = NULL;
 }
 
-static struct sock *red_get_available_subflow(struct sock *meta_sk,
+static struct sock *ol_get_available_subflow(struct sock *meta_sk,
 					      struct sk_buff *skb,
 					      bool zero_wnd_test)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
-	struct redsched_cb *red_cb = redsched_get_cb(meta_tp);
-	struct tcp_sock *first_tp = red_cb->next_subflow, *tp;
+	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct tcp_sock *first_tp = ol_cb->next_subflow, *tp;
 	struct mptcp_tcp_sock *mptcp;
 	int found = 0;
 
@@ -159,7 +163,7 @@ static struct sock *red_get_available_subflow(struct sock *meta_sk,
 
 		if (mptcp_is_available((struct sock *)tp, skb,
 				       zero_wnd_test)) {
-			redsched_update_next_subflow(tp, red_cb);
+			olsched_update_next_subflow(tp, ol_cb);
 			return (struct sock *)tp;
 		}
 	}
@@ -172,7 +176,7 @@ static struct sock *red_get_available_subflow(struct sock *meta_sk,
 
 		if (mptcp_is_available((struct sock *)tp, skb,
 				       zero_wnd_test)) {
-			redsched_update_next_subflow(tp, red_cb);
+			olsched_update_next_subflow(tp, ol_cb);
 			return (struct sock *)tp;
 		}
 	}
@@ -182,26 +186,27 @@ static struct sock *red_get_available_subflow(struct sock *meta_sk,
 }
 
 /* Corrects the stored skb pointers if they are invalid */
-static void redsched_correct_skb_pointers(struct sock *meta_sk,
-					  struct redsched_priv *red_p)
+static void olsched_correct_skb_pointers(struct sock *meta_sk,
+					  struct olsched_priv *ol_p)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 
-	if (red_p->skb &&
-	    (!after(red_p->skb_end_seq, meta_tp->snd_una) ||
-	     after(red_p->skb_end_seq, meta_tp->snd_nxt)))
-		red_p->skb = NULL;
+	if (ol_p->skb &&
+	    (!after(ol_p->skb_end_seq, meta_tp->snd_una) ||
+	     after(ol_p->skb_end_seq, meta_tp->snd_nxt)))
+		ol_p->skb = NULL;
 }
 
 /* Returns the next skb from the queue */
-static struct sk_buff *redsched_next_skb_from_queue(struct sk_buff_head *queue,
+static struct sk_buff *olsched_next_skb_from_queue(struct sk_buff_head *queue,
 						    struct sk_buff *previous,
 						    struct sock *meta_sk)
 {
 	struct sk_buff *skb;
 
 	if (!previous)
-		return tcp_rtx_queue_head(meta_sk) ? : skb_peek(queue);
+		return tcp_rtx_queue_head(meta_sk) ? : skb_peek(queue); 
+		// skb_peek(queue) is the same as tcp_send_head(meta_sk)
 
 	/* sk_data->skb stores the last scheduled packet for this subflow.
 	 * If sk_data->skb was scheduled but not sent (e.g., due to nagle),
@@ -221,24 +226,24 @@ static struct sk_buff *redsched_next_skb_from_queue(struct sk_buff_head *queue,
 	 * packet can be skipped.
 	 */
 	if (tcp_send_head(meta_sk) == previous)
-		return tcp_send_head(meta_sk);
+		return tcp_send_head(meta_sk);// ytxing: this is the normal skb
 
-	skb = skb_rb_next(previous);
+	skb = skb_rb_next(previous);// ytxing: this is the redundant skb
 	if (skb)
 		return skb;
 
 	return tcp_send_head(meta_sk);
 }
 
-static struct sk_buff *mptcp_red_next_segment(struct sock *meta_sk,
+static struct sk_buff *mptcp_ol_next_segment(struct sock *meta_sk,
 					      int *reinject,
 					      struct sock **subsk,
 					      unsigned int *limit)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
-	struct redsched_cb *red_cb = redsched_get_cb(meta_tp);
-	struct tcp_sock *first_tp = red_cb->next_subflow, *tp;
+	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct tcp_sock *first_tp = ol_cb->next_subflow, *tp;
 	struct mptcp_tcp_sock *mptcp;
 	int active_valid_sks = -1;
 	struct sk_buff *skb;
@@ -277,7 +282,7 @@ static struct sk_buff *mptcp_red_next_segment(struct sock *meta_sk,
 	tp = first_tp;
 
 	*reinject = 0;
-	active_valid_sks = redsched_get_active_valid_sks(meta_sk);
+	active_valid_sks = olsched_get_active_valid_sks(meta_sk);
 
 	/* We want to pick a subflow that is after 'first_tp' in the list of subflows.
 	 * Thus, the first mptcp_for_each_sub()-loop tries to walk the list up
@@ -287,7 +292,7 @@ static struct sk_buff *mptcp_red_next_segment(struct sock *meta_sk,
 	 * beginning of the list up to 'first_tp'.
 	 */
 	mptcp_for_each_sub(mpcb, mptcp) {
-		struct redsched_priv *red_p;
+		struct olsched_priv *ol_p;
 
 		if (tp == mptcp->tp)
 			found = 1;
@@ -298,16 +303,16 @@ static struct sk_buff *mptcp_red_next_segment(struct sock *meta_sk,
 		tp = mptcp->tp;
 
 		/* Correct the skb pointers of the current subflow */
-		red_p = redsched_get_priv(tp);
-		redsched_correct_skb_pointers(meta_sk, red_p);
+		ol_p = olsched_get_priv(tp);
+		olsched_correct_skb_pointers(meta_sk, ol_p);
 
-		skb = redsched_next_skb_from_queue(&meta_sk->sk_write_queue,
-						   red_p->skb, meta_sk);
-		if (skb && redsched_use_subflow(meta_sk, active_valid_sks, tp,
+		skb = olsched_next_skb_from_queue(&meta_sk->sk_write_queue,
+						   ol_p->skb, meta_sk);
+		if (skb && olsched_use_subflow(meta_sk, active_valid_sks, tp,
 						skb)) {
-			red_p->skb = skb;
-			red_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
-			redsched_update_next_subflow(tp, red_cb);
+			ol_p->skb = skb;
+			ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
+			olsched_update_next_subflow(tp, ol_cb);
 			*subsk = (struct sock *)tp;
 
 			if (TCP_SKB_CB(skb)->path_mask)
@@ -317,7 +322,7 @@ static struct sk_buff *mptcp_red_next_segment(struct sock *meta_sk,
 	}
 
 	mptcp_for_each_sub(mpcb, mptcp) {
-		struct redsched_priv *red_p;
+		struct olsched_priv *ol_p;
 
 		tp = mptcp->tp;
 
@@ -325,16 +330,16 @@ static struct sk_buff *mptcp_red_next_segment(struct sock *meta_sk,
 			break;
 
 		/* Correct the skb pointers of the current subflow */
-		red_p = redsched_get_priv(tp);
-		redsched_correct_skb_pointers(meta_sk, red_p);
+		ol_p = olsched_get_priv(tp);
+		olsched_correct_skb_pointers(meta_sk, ol_p);
 
-		skb = redsched_next_skb_from_queue(&meta_sk->sk_write_queue,
-						   red_p->skb, meta_sk);
-		if (skb && redsched_use_subflow(meta_sk, active_valid_sks, tp,
+		skb = olsched_next_skb_from_queue(&meta_sk->sk_write_queue,
+						   ol_p->skb, meta_sk);
+		if (skb && olsched_use_subflow(meta_sk, active_valid_sks, tp,
 						skb)) {
-			red_p->skb = skb;
-			red_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
-			redsched_update_next_subflow(tp, red_cb);
+			ol_p->skb = skb;
+			ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
+			olsched_update_next_subflow(tp, ol_cb);
 			*subsk = (struct sock *)tp;
 
 			if (TCP_SKB_CB(skb)->path_mask)
@@ -347,46 +352,165 @@ static struct sk_buff *mptcp_red_next_segment(struct sock *meta_sk,
 	return NULL;
 }
 
-static void redsched_release(struct sock *sk)
+// ytxing: 	1. find a subflow with minimal RTT;
+//			2. get a redundant or normal skb for the subflow
+static struct sk_buff *mptcp_ol_next_segment_mine(struct sock *meta_sk,
+					      int *reinject,
+					      struct sock **subsk,
+					      unsigned int *limit)
+{
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
+	struct mptcp_cb *mpcb = meta_tp->mpcb;
+	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct tcp_sock *first_tp = ol_cb->next_subflow, *tp;
+	struct mptcp_tcp_sock *mptcp;
+	int active_valid_sks = -1;
+	struct sk_buff *skb;
+	int found = 0;
+
+	/* As we set it, we have to reset it as well. */
+	*limit = 0;
+
+	if (skb_queue_empty(&mpcb->reinject_queue) &&
+	    skb_queue_empty(&meta_sk->sk_write_queue) &&
+	    tcp_rtx_queue_empty(meta_sk))
+		/* Nothing to send */
+		return NULL;
+
+	/* First try reinjections */
+	skb = skb_peek(&mpcb->reinject_queue);
+	if (skb) {
+		*subsk = get_available_subflow(meta_sk, skb, false);
+		if (!*subsk)
+			return NULL;
+		*reinject = 1;
+		return skb;
+	}
+
+	/* Then try indistinctly redundant and normal skbs */
+
+	// if (!first_tp && !hlist_empty(&mpcb->conn_list)) {
+	// 	first_tp = hlist_entry_safe(rcu_dereference_raw(hlist_first_rcu(&mpcb->conn_list)),
+	// 				    struct mptcp_tcp_sock, node)->tp;
+	// }
+
+	/* still NULL (no subflow in conn_list?) */
+	// if (!first_tp)
+	// 	return NULL;
+
+	// tp = first_tp;
+
+	*reinject = 0;
+	active_valid_sks = olsched_get_active_valid_sks(meta_sk);
+
+	/* We want to pick a subflow that is after 'first_tp' in the list of subflows.
+	 * Thus, the first mptcp_for_each_sub()-loop tries to walk the list up
+	 * to the subflow 'tp' and then checks whether any one of the remaining
+	 * ones can send a segment.
+	 * The second mptcp_for_each-sub()-loop is then iterating from the
+	 * beginning of the list up to 'first_tp'.
+	 */
+	mptcp_for_each_sub(mpcb, mptcp) {
+		struct olsched_priv *ol_p;
+
+		if (tp == mptcp->tp)
+			found = 1;
+
+		if (!found)
+			continue;
+
+		tp = mptcp->tp;
+
+		/* Correct the skb pointers of the current subflow */
+		ol_p = olsched_get_priv(tp);
+		olsched_correct_skb_pointers(meta_sk, ol_p);
+
+		skb = olsched_next_skb_from_queue(&meta_sk->sk_write_queue,
+						   ol_p->skb, meta_sk);
+		if (skb && olsched_use_subflow(meta_sk, active_valid_sks, tp,
+						skb)) {
+			ol_p->skb = skb;
+			ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
+			olsched_update_next_subflow(tp, ol_cb);
+			*subsk = (struct sock *)tp;
+
+			if (TCP_SKB_CB(skb)->path_mask)
+				*reinject = -1;
+			return skb;
+		}
+	}
+
+	mptcp_for_each_sub(mpcb, mptcp) {
+		struct olsched_priv *ol_p;
+
+		tp = mptcp->tp;
+
+		if (tp == first_tp)
+			break;
+
+		/* Correct the skb pointers of the current subflow */
+		ol_p = olsched_get_priv(tp);
+		olsched_correct_skb_pointers(meta_sk, ol_p);
+
+		skb = olsched_next_skb_from_queue(&meta_sk->sk_write_queue,
+						   ol_p->skb, meta_sk);
+		if (skb && olsched_use_subflow(meta_sk, active_valid_sks, tp,
+						skb)) {
+			ol_p->skb = skb;
+			ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
+			olsched_update_next_subflow(tp, ol_cb);
+			*subsk = (struct sock *)tp;
+
+			if (TCP_SKB_CB(skb)->path_mask)
+				*reinject = -1;
+			return skb;
+		}
+	}
+
+	/* Nothing to send */
+	return NULL;
+}
+
+static void olsched_release(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
-	struct redsched_cb *red_cb = redsched_get_cb(tp);
+	struct olsched_cb *ol_cb = olsched_get_cb(tp);
 
 	/* Check if the next subflow would be the released one. If yes correct
 	 * the pointer
 	 */
-	if (red_cb->next_subflow == tp)
-		redsched_update_next_subflow(tp, red_cb);
+	if (ol_cb->next_subflow == tp)
+		olsched_update_next_subflow(tp, ol_cb);
 }
 
-static struct mptcp_sched_ops mptcp_sched_red = {
-	.get_subflow = red_get_available_subflow,
-	.next_segment = mptcp_red_next_segment,
-	.release = redsched_release,
+static struct mptcp_sched_ops mptcp_sched_ol = {
+	.get_subflow = ol_get_available_subflow,
+	.next_segment = mptcp_ol_next_segment,
+	.release = olsched_release,
 	.name = "ol",
 	.owner = THIS_MODULE,
 };
 
-static int __init red_register(void)
+static int __init ol_register(void)
 {
-	BUILD_BUG_ON(sizeof(struct redsched_priv) > MPTCP_SCHED_SIZE);
-	BUILD_BUG_ON(sizeof(struct redsched_cb) > MPTCP_SCHED_DATA_SIZE);
-
-	if (mptcp_register_scheduler(&mptcp_sched_red))
+	printk(KERN_DEBUG "ytxing: olsched_priv size :%lu (< %u)\n", sizeof(struct olsched_priv), MPTCP_SCHED_SIZE);
+	printk(KERN_DEBUG "ytxing: olsched_cb size :%lu (< %u)\n", sizeof(struct olsched_cb), MPTCP_SCHED_DATA_SIZE);
+	BUILD_BUG_ON(sizeof(struct olsched_priv) > MPTCP_SCHED_SIZE);
+	BUILD_BUG_ON(sizeof(struct olsched_cb) > MPTCP_SCHED_DATA_SIZE);
+	if (mptcp_register_scheduler(&mptcp_sched_ol))
 		return -1;
-
 	return 0;
 }
 
-static void red_unregister(void)
+static void ol_unregister(void)
 {
-	mptcp_unregister_scheduler(&mptcp_sched_red);
+	mptcp_unregister_scheduler(&mptcp_sched_ol);
 }
 
-module_init(red_register);
-module_exit(red_unregister);
+module_init(ol_register);
+module_exit(ol_unregister);
 
 MODULE_AUTHOR("Yitao Xing");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("OL MPTCP");
-MODULE_VERSION("0.95");
+MODULE_VERSION("0.01");
