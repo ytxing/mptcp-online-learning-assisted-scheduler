@@ -21,6 +21,8 @@
 #include <net/mptcp.h>
 
 #define OLSCHED_SCALE 8
+#define OLSCHED_INIT_RATIO 0
+
 
 /* Struct to store the data of a single subflow */
 struct olsched_priv {
@@ -60,15 +62,17 @@ static bool olsched_get_active_valid_sks(struct sock *meta_sk)
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
 	struct mptcp_tcp_sock *mptcp;
 	int active_valid_sks = 0;
+	int i = 0;
 
 	mptcp_for_each_sub(mpcb, mptcp) {
 		struct sock *sk = mptcp_to_sock(mptcp);
-
+		i++;
 		if (subflow_is_active((struct tcp_sock *)sk) &&
 		    !mptcp_is_def_unavailable(sk))
 			active_valid_sks++;
 	}
-
+		
+	printk(KERN_DEBUG "ytxing： active_valid_sks: %d i: %d\n", active_valid_sks, i);
 	return active_valid_sks;
 }
 
@@ -212,8 +216,9 @@ static struct sock *get_shorter_rtt_subflow_with_selector(struct mptcp_cb *mpcb,
 	u32 best_srtt = 0;
 	struct mptcp_tcp_sock *mptcp;
 
-	if (bestsk)
+	if (bestsk){
 		best_srtt = tcp_sk(bestsk)->srtt_us;
+	}
 
 	mptcp_for_each_sub(mpcb, mptcp) {
 		struct sock *sk = mptcp_to_sock(mptcp);
@@ -233,6 +238,7 @@ static struct sock *get_shorter_rtt_subflow_with_selector(struct mptcp_cb *mpcb,
 			better_srtt = tp->srtt_us;
 			bettersk = sk;
 		}
+		printk(KERN_DEBUG "ytxing：find minrtt sk %llu srtt %lu\n", sk, tp->srtt_us);
 	}
 
 	return bettersk;
@@ -241,16 +247,16 @@ static struct sock *get_shorter_rtt_subflow_with_selector(struct mptcp_cb *mpcb,
 /* ytxing:	calculate the redundant quota of this subflow 
  *			e.g., how many redundant should it send
  */
-static void olsched_check_quota(struct mptcp_tcp_sock *mptcp,
+static void olsched_check_quota(struct tcp_sock *tp,
 					  struct olsched_priv *ol_p)
 {
-	struct tcp_sock *tp = mptcp->tp;
+	
 	// still has quota, no need to calculate again
 	if (ol_p->red_quota > 0 || ol_p->new_quota > 0)
 		return;
-
 	ol_p->red_quota =  (tp->snd_cwnd * ol_p->red_ratio) >> OLSCHED_SCALE;
 	ol_p->new_quota = tp->snd_cwnd - ol_p->red_quota;
+	printk(KERN_INFO "ytxing：mptcp %llu red_quota %u new_quota %u \n", mptcp, ol_p->red_quota, ol_p->new_quota, ol_p->new_quota);
 }
 
 
@@ -421,7 +427,7 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
 	struct olsched_priv *ol_p;
 	struct tcp_sock *tp;
-	struct mptcp_tcp_sock *mptcp;
+	// struct mptcp_tcp_sock *mptcp;
 	int active_valid_sks = -1;
 	struct sk_buff *skb;
 	struct sock *sk, *unavailable_sk;
@@ -454,15 +460,15 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 
 	unavailable_sk = NULL;
 	/* ytxing: in this loop we find a avaliable sk with rtt as short as possible*/
-	for(i; i < active_valid_sks; i++){
+	for(i = 0; i < active_valid_sks; i++){
 		sk = get_shorter_rtt_subflow_with_selector(mpcb, unavailable_sk ,&subflow_is_active);
-		tp = tcp_sk(sk);
-		if (!tp)
+		if (!sk)
 			break;
+		tp = tcp_sk(sk);
+		printk(KERN_DEBUG "ytxing： i: %d sk: %llu srtt: %lu\n", i, sk, (tp->srtt_us >> 3));
 		ol_p = olsched_get_priv(tp);
 		olsched_correct_skb_pointers(meta_sk, ol_p);
-		olsched_check_quota(mptcp, ol_p); // ytxing
-
+		olsched_check_quota(tp, ol_p); // ytxing
 		if (ol_p->red_quota >= 1){ // Executing redundant routines
 			skb = olsched_next_skb_from_queue(&meta_sk->sk_write_queue,
 								ol_p->skb, meta_sk);
@@ -473,10 +479,12 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 				ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
 				olsched_update_next_subflow(tp, ol_cb);
 				*subsk = (struct sock *)tp;
-				printk(KERN_INFO "ytxing skb_len %u (mss?)\n", skb->len);
+				// printk(KERN_DEBUG "ytxing skb_len %u (mss?)\n", skb->len);
 				ol_p->red_quota -= 1;
-				if (TCP_SKB_CB(skb)->path_mask)
+				if (TCP_SKB_CB(skb)->path_mask){
 					*reinject = -1;
+					printk(KERN_DEBUG "ytxing： a red pkt\n");
+					}
 				return skb;
 			}
 		}
@@ -488,7 +496,7 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 				ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
 				olsched_update_next_subflow(tp, ol_cb);
 				*subsk = (struct sock *)tp;
-				printk(KERN_INFO "ytxing skb_len %u (mss?)\n", skb->len);
+				// printk(KERN_DEBUG "ytxing skb_len %u (mss?)\n", skb->len);
 				ol_p->new_quota -= 1;
 				if (TCP_SKB_CB(skb)->path_mask)
 					*reinject = -1;
@@ -522,7 +530,9 @@ static void olsched_init(struct sock *sk)
 	struct olsched_priv *ol_p = olsched_get_priv(tcp_sk(sk));
 	struct olsched_cb *ol_cb = olsched_get_cb(tcp_sk(mptcp_meta_sk(sk)));
 
-	ol_p->red_ratio = 0xFF;
+	ol_p->red_ratio = 0xFF * OLSCHED_INIT_RATIO;
+	ol_p->red_quota = 0;
+	ol_p->new_quota = 0;
 
 	if(ol_cb->next_subflow == NULL)
 		ol_cb->next_subflow = NULL; //ytxing: nothing...
@@ -530,7 +540,7 @@ static void olsched_init(struct sock *sk)
 
 static struct mptcp_sched_ops mptcp_sched_ol = {
 	.get_subflow = ol_get_available_subflow,
-	.next_segment = mptcp_ol_next_segment,
+	.next_segment = mptcp_ol_next_segment_rtt,
 	.init = olsched_init,
 	.release = olsched_release,
 	.name = "ol",
