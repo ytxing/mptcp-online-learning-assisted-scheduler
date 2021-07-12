@@ -23,6 +23,20 @@
 #define OLSCHED_SCALE 8
 #define OLSCHED_INIT_RED_RATIO 0
 
+/* ytxing: for utility function calculation */
+#define OLSCHED_ALPHA 0.99 /* (0, 1) */
+#define OLSCHED_BETA 2
+#define OLSCHED_GAMMA 2
+
+/* Scale factor for rate in pkt/uSec unit to avoid truncation in bandwidth
+ * estimation. The rate unit ~= (1500 bytes / 1 usec / 2^24) ~= 715 bps.
+ * This handles bandwidths from 0.06pps (715bps) to 256Mpps (3Tbps) in a u32.
+ * Since the minimum window is >=4 packets, the lower bound isn't
+ * an issue. The upper bound isn't an issue with existing technologies.
+ */
+// #define BW_SCALE 24
+// #define BW_UNIT (1 << BW_SCALE)
+
 
 /* Struct to store the data of a single subflow */
 struct olsched_priv {
@@ -74,6 +88,26 @@ static int olsched_get_active_valid_sks_num(struct sock *meta_sk)
 		
 	printk(KERN_DEBUG "ytxing: active_valid_sks: %d/%d\n", active_valid_sks, i);
 	return active_valid_sks;
+}
+
+static __u64 olsched_get_bandwidth(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	u32 rtt_us, mss_now; 
+	__u64 bandwidth;
+
+	if (tp->srtt_us) {		/* any RTT sample yet? */
+		rtt_us = max(tp->srtt_us >> 3, 1U);
+	} else {			 /* no RTT sample yet */
+		rtt_us = USEC_PER_MSEC;	 /* use nominal default RTT ytxing maybe TODO */
+	}
+	
+	mss_now = tcp_current_mss(sk);
+	bandwidth = (__u64)tp->snd_cwnd * mss_now * USEC_PER_SEC;
+	do_div(bandwidth, rtt_us);
+		
+	printk(KERN_DEBUG "ytxing: tp: %lu bandwidth%lu rtt:%lu(ms) cwnd:%lu\n", tp, i);
+	return bandwidth; /* Bps */
 }
 
 static bool olsched_use_subflow(struct sock *meta_sk,
@@ -296,6 +330,49 @@ static struct sk_buff *olsched_next_skb_from_queue(struct sk_buff_head *queue,
 
 	return tcp_send_head(meta_sk);
 }
+
+/* ytxing:	calculate the utility of curr_sk
+ *			This function is only called once a Scheduling Interval (SI) maybe(?)
+ *			When calling this function, there should be valid bandwidth and rtt sample for all subflows
+ *			u = 
+ */
+static __u64 ol_calc_utility(struct sock *meta_sk, struct sock *curr_sk) {
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk), *tp, *curr_tp = tcp_sk(curr_sk);	
+	struct mptcp_cb *mpcb = meta_tp->mpcb;
+	struct olsched_priv *curr_ol_p = olsched_get_priv(curr_tp);
+	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+
+	__u64 others_bw, bw_t, curr_bw;
+	__u32 ratio_t;
+
+	__u64 bw_item, ofo_item, loss_item, utility;
+
+	/* ytxing:	in this loop, we calculate the ratio*bandwidth of other subflows */
+	mptcp_for_each_sub(mpcb, mptcp) {
+		struct sock *sk = mptcp_to_sock(mptcp);		
+		tp = mptcp->tp;
+		struct olsched_priv *ol_p;
+
+		if (curr_sk == sk)
+			continue;
+		if (!subflow_is_active(tp) || mptcp_is_def_unavailable(sk))
+			continue;
+
+		ol_p = olsched_get_priv(tp);
+		ratio_t = ol_p->red_ratio;
+		bw_t = olsched_get_bandwidth(sk); 
+		others_bw = ratio_t * bw_t;
+	}
+	curr_bw = olsched_get_bandwidth(curr_sk);
+	bw_item = others_bw + curr_bw * curr_ol_p->red_ratio;
+	bw_item = bw_item /* OLSCHED_ALPHA power TODO*/;
+	ofo_item = bw_item  /* x dRTT TODO */;
+	loss_item = bw_item /* x loss_rate TODO*/;
+	utility = bw_item + OLSCHED_BETA * ofo_item + OLSCHED_GAMMA * loss_item;
+
+	return utility;
+}
+
 
 static struct sk_buff *mptcp_ol_next_segment(struct sock *meta_sk,
 					      int *reinject,
