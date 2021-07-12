@@ -21,7 +21,7 @@
 #include <net/mptcp.h>
 
 #define OLSCHED_SCALE 8
-#define OLSCHED_INIT_RED_RATIO 1
+#define OLSCHED_INIT_RED_RATIO 0
 
 
 /* Struct to store the data of a single subflow */
