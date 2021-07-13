@@ -20,8 +20,10 @@
 #include <linux/module.h>
 #include <net/mptcp.h>
 
-#define OLSCHED_SCALE 7
-#define OLSCHED_UNIT (1 << 7) /*(0, 128)*/
+#define OLSCHED_INTERVALS 4
+
+#define OLSCHED_SCALE 12
+#define OLSCHED_UNIT (1 << OLSCHED_SCALE) /*(0, 128)*/
 #define OLSCHED_INIT_RED_RATIO 0
 
 /* ytxing: for utility function calculation */
@@ -38,39 +40,19 @@
 // #define BW_SCALE 24
 // #define BW_UNIT (1 << BW_SCALE)
 
-/* ytxing: olsched_data for each subflow */
-struct olsched_data {
-	struct pcc_interval *intervals; /* containts stats for 1 RTT */
-	int send_index; /* index of interval currently being sent */
-	int recive_index; /* index of interval currently receiving acks */
+/* ytxing:	
+ * olsched_interval for each subflow.
+ * This store some status at the beginning and the end of an interval,
+ * in order to record the behaviour of this subflow and for utility 
+ * function caculation.
+ */
+struct olsched_interval {
 
-	s64 rate; /* current sending rate */
-	s64 last_rate; /* previous sending rate */
+	u32 delivered_begin; /*pkts*/
+	u32 delivered_end; /*pkts*/
+	u32 lost_begin; /*pkts*/
+	u32 lost_end; /*pkts*/
 
-	/* utility function pointer (can be loss- or latency-based) */
-	void (*util_func)(struct pcc_data *, struct pcc_interval *, struct sock *);
-
-	bool start_mode; /* in slow start? */
-	bool moving; /* using gradient ascent to move to a new rate? */
-	bool loss_state; /* njay -> nogah: not sure */
-
-	bool wait; /* njay-> nogah: not sure */
-	enum PCC_DECISION last_decision; /* most recent rate change direction */
-	u32 lost_base; /* previously lost packets */
-	u32 delivered_base; /* previously delivered packets */
-
-	// debug helpers
-	int id;
-	int decisions_count;
-
-	/* njay-> nogah: not sure about comments here */
-	u32 packets_sent;
-	u32 packets_counted;
-	u32 spare;
-
-	s32 amplifier; /* multiplier on the current step size */
-	s32 swing_buffer; /* number of RTTs left before step size can grow */
-	s32 change_bound; /* maximum change as a proportion of the current rate */
 };
 
 /* Struct to store the data of a single subflow */
@@ -82,11 +64,13 @@ struct olsched_priv {
 	 */
 	u32 skb_end_seq;
 
-	struct olsched_data *ol_data;
+	/* Structure to store current status for each subflow */
+	struct olsched_interval *ol_interval;
 
+	/* Some "long-term" status for each subflow */
 	__u16 red_quota; // ytxing: how many redundant pkts should this subflow send
 	__u16 new_quota; // ytxing: how many new pkts should this subflow send
-	__u8  red_ratio; // ytxing: (0, 128), multiply and >> OLSCHED_SCALE
+	__u16 red_ratio; // ytxing: (0, 128), multiply and >> OLSCHED_SCALE
 };
 
 /* Struct to store the data of the control block */
@@ -148,31 +132,30 @@ static __u64 olsched_get_bandwidth(struct sock *sk)
 	bandwidth = (__u64)tp->snd_cwnd * mss_now * USEC_PER_SEC;
 	do_div(bandwidth, rtt_us);
 		
-	printk(KERN_DEBUG "ytxing: tp: %p bandwidth%lu rtt:%lu(ms) cwnd:%lu\n", tp, i);
+	printk(KERN_DEBUG "ytxing: tp: %p bandwidth%llu rtt:%u(us) cwnd:%u\n", tp, bandwidth, rtt_us, tp->snd_cwnd);
 	return bandwidth; /* Bps */
 }
 
-/* ytxing:	get the loss rate of the sk
- *			in (0, 128), i.e., (0, 1) << OLSCHED_SCALE
+/* ytxing:	
+ * get the loss rate of the sk, make sure this interval is COMPLETED		
+ * in (0, 1) << OLSCHED_SCALE
  */
 static __u64 olsched_get_loss_rate(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
-	u32 rtt_us, mss_now; 
-	__u64 bandwidth;
+	struct olsched_priv *ol_p = olsched_get_priv(tp);
+	struct olsched_interval *interval = ol_p->ol_interval;
+	__u64 loss_rate;
+	u32 delivered;
 
-	if (tp->srtt_us) {		/* any RTT sample yet? */
-		rtt_us = max(tp->srtt_us >> 3, 1U);
-	} else {			 /* no RTT sample yet */
-		rtt_us = USEC_PER_MSEC;	 /* use nominal default RTT ytxing maybe TODO */
-	}
-	
-	mss_now = tcp_current_mss(sk);
-	bandwidth = (__u64)tp->snd_cwnd * mss_now * USEC_PER_SEC;
-	do_div(bandwidth, rtt_us);
-		
-	printk(KERN_DEBUG "ytxing: tp: %p bandwidth%lu rtt:%lu(ms) cwnd:%lu\n", tp, i);
-	return bandwidth; /* Bps */
+	/* nothing delivered*/
+	if (interval->delivered_end == interval->delivered_begin)
+		return (1 << OLSCHED_SCALE); 
+
+	loss_rate = (interval->lost_end - interval->lost_begin) << OLSCHED_SCALE;
+	delivered = interval->delivered_end - interval->delivered_begin;
+	do_div(loss_rate, delivered);
+	return loss_rate;
 }
 
 
@@ -355,7 +338,7 @@ static void olsched_check_quota(struct tcp_sock *tp,
 		return;
 	ol_p->red_quota =  (tp->snd_cwnd * ol_p->red_ratio) >> OLSCHED_SCALE;
 	ol_p->new_quota = tp->snd_cwnd - ol_p->red_quota;
-	printk(KERN_INFO "ytxing: tp %llu red_quota %u new_quota %u ratio %u/255\n", tp, ol_p->red_quota, ol_p->new_quota, ol_p->red_ratio);
+	printk(KERN_INFO "ytxing: tp %p red_quota %u new_quota %u ratio %u/255\n", tp, ol_p->red_quota, ol_p->new_quota, ol_p->red_ratio);
 }
 
 
@@ -397,25 +380,27 @@ static struct sk_buff *olsched_next_skb_from_queue(struct sk_buff_head *queue,
 	return tcp_send_head(meta_sk);
 }
 
-/* ytxing:	calculate the utility of curr_sk
- *			This function is only called once a Scheduling Interval (SI) maybe(?)
- *			When calling this function, there should be valid bandwidth and rtt sample for all subflows
- *			u = 
+/* ytxing:
+ * calculate the utility of curr_sk
+ * This function is only called once when one Scheduling Interval(SI) finishes.
+ * When calling this function, there should be valid bandwidth 
+ * and rtt sample for all subflows .
  */
 #define FIXEDPT_BITS 64
 #define FIXEDPT_WBITS 40
 #define OMIT_STDINT
 #include "fixedptc.h"
 static __u64 ol_calc_utility(struct sock *meta_sk, struct sock *curr_sk) {
-	struct tcp_sock *meta_tp = tcp_sk(meta_sk), *tp, *curr_tp = tcp_sk(curr_sk);	
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk), *curr_tp = tcp_sk(curr_sk);	
+	struct mptcp_tcp_sock *mptcp;
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
 	struct olsched_priv *curr_ol_p = olsched_get_priv(curr_tp);
 	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
 
-	__u64 others_bw, bw_t, curr_bw, dRTT /* ((curr_rtt - minRTT) << OLSCHED_SCALE / minRTT) */;
+	__u64 others_bw, curr_bw, dRTT /* ((curr_rtt - minRTT) << OLSCHED_SCALE / minRTT) */;
 	u32 ratio_t, minRTT = 0xFFFFFFFF;
 
-	__u64 bw_item, bw_item_f, ofo_item, loss_item, utility;
+	__u64 bw_item, bw_item_f, ofo_item, loss_rate, loss_item, utility;
 
 	/* ytxing:	in this loop, we 
 	 *			1. calculate the ratio*bandwidth of other subflows 
@@ -423,8 +408,9 @@ static __u64 ol_calc_utility(struct sock *meta_sk, struct sock *curr_sk) {
 	 */
 	mptcp_for_each_sub(mpcb, mptcp) {
 		struct sock *sk = mptcp_to_sock(mptcp);		
-		tp = mptcp->tp;
+		struct tcp_sock *tp = mptcp->tp;
 		struct olsched_priv *ol_p;
+		__u64 bw_t;
 
 		if (!subflow_is_active(tp) || mptcp_is_def_unavailable(sk)) /* we ignore unavailable subflows*/
 			continue;
@@ -445,12 +431,12 @@ static __u64 ol_calc_utility(struct sock *meta_sk, struct sock *curr_sk) {
 	/* bandwidth item */
 	curr_bw = olsched_get_bandwidth(curr_sk);
 	bw_item = others_bw + curr_bw * curr_ol_p->red_ratio;
-	printk(KERN_DEBUG "ytxing: tp:%p bw_item: %llu\n", tp, bw_item);
+	printk(KERN_DEBUG "ytxing: tp:%p bw_item: %llu\n", curr_tp, bw_item);
 
 	bw_item_f = fixedpt_fromint(bw_item);
 	bw_item_f = fixedpt_pow(bw_item_f, fixedpt_rconst(OLSCHED_ALPHA));
 	bw_item = (bw_item_f >> FIXEDPT_FBITS); /* OLSCHED_ALPHA power TODO (does it work?*/;
-	printk(KERN_DEBUG "ytxing: tp:%p bw_item^%f: %llu\n", tp, OLSCHED_ALPHA, bw_item);
+	printk(KERN_DEBUG "ytxing: tp:%p bw_item^%f: %llu\n", curr_tp, OLSCHED_ALPHA, bw_item);
 
 	/* dRTT(ofo) item */
 	if(curr_tp->srtt_us == minRTT) {
@@ -464,7 +450,8 @@ static __u64 ol_calc_utility(struct sock *meta_sk, struct sock *curr_sk) {
 	ofo_item = (bw_item * dRTT) >> OLSCHED_SCALE;
 
 	/* loss item */
-	loss_item = bw_item /* x loss_rate TODO*/;
+	loss_rate = olsched_get_loss_rate(curr_sk);
+	loss_item = (bw_item * loss_rate) >> OLSCHED_SCALE; /* x loss_rate TODO*/
 
 	/* finally, the utility function */
 	utility = bw_item + OLSCHED_BETA * ofo_item + OLSCHED_GAMMA * loss_item;
@@ -709,6 +696,9 @@ static void olsched_init(struct sock *sk)
 	struct olsched_priv *ol_p = olsched_get_priv(tcp_sk(sk));
 	struct olsched_cb *ol_cb = olsched_get_cb(tcp_sk(mptcp_meta_sk(sk)));
 
+	ol_p->ol_interval = kzalloc(sizeof(struct olsched_interval) * OLSCHED_INTERVALS * 2,
+				 GFP_KERNEL);
+
 	ol_p->red_ratio = OLSCHED_UNIT * OLSCHED_INIT_RED_RATIO;
 	ol_p->red_quota = 0;
 	ol_p->new_quota = 0;
@@ -717,7 +707,7 @@ static void olsched_init(struct sock *sk)
 		ol_cb->next_subflow = NULL; //ytxing: nothing...
 
 	
-	printk(KERN_DEBUG "ytxing: olsched_init tp %llu\n", tcp_sk(sk));
+	printk(KERN_DEBUG "ytxing: olsched_init tp %p\n", tcp_sk(sk));
 }
 
 static struct mptcp_sched_ops mptcp_sched_ol = {
