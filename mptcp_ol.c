@@ -48,10 +48,11 @@
  */
 struct olsched_interval {
 
-	u32 delivered_begin; /*pkts*/
-	u32 delivered_end; /*pkts*/
-	u32 lost_begin; /*pkts*/
-	u32 lost_end; /*pkts*/
+	u32 delivered_begin; 	/*pkts*/
+	u32 delivered_end; 		/*pkts*/
+	
+	u32 lost_begin; 		/*pkts*/
+	u32 lost_end; 			/*pkts*/
 
 };
 
