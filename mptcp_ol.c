@@ -39,17 +39,18 @@ typedef __s64 s64;
 #define OLSCHED_UNIT (1 << OLSCHED_SCALE)
 #define OLSCHED_MAX_RED_RATIO OLSCHED_UNIT
 #define OLSCHED_MIN_RED_RATIO 0
-#define OLSCHED_INIT_RED_RATIO 0
+#define OLSCHED_INIT_RED_RATIO (1 * OLSCHED_UNIT)
 #define OLSCHED_PROBING_EPSILON (OLSCHED_UNIT * 0.01)
 #define OLSCHED_GRAD_NOISE 0.001
-#define OLSCHED_GRAD_STEP_SIZE (OLSCHED_UNIT * 0.01)
-#define OLSCHED_GRAD_MIN_STEP_SIZE (OLSCHED_UNIT * 0.05)
+#define OLSCHED_GRAD_STEP (OLSCHED_UNIT * 0.01)
+#define OLSCHED_GRAD_MIN_STEP (OLSCHED_UNIT * 0.05)
+#define OLSCHED_START_STEP (OLSCHED_UNIT * 0.1)
 
 
 /* ytxing: for utility function calculation */
 #define OLSCHED_ALPHA 0.99 /* (0, 1) */
-#define OLSCHED_BETA 2
-#define OLSCHED_GAMMA 2
+#define OLSCHED_BETA 1
+#define OLSCHED_GAMMA 1
 
 /* Scale factor for rate in pkt/uSec unit to avoid truncation in bandwidth
  * estimation. The rate unit ~= (1500 bytes / 1 usec / 2^24) ~= 715 bps.
@@ -95,6 +96,7 @@ struct ol_interval {
 	u32 lost_bytes;
 
 	u64 utility;
+	u64 previous_utility;
 
 	u8	snd_timeout:1,
 			snd_ended:1,
@@ -106,7 +108,7 @@ struct ol_interval {
 enum OL_GLOBAL_STATE {
 	OL_PROBE, // sending data for probing 
 	OL_MOVE,  // move toward one direction, stop when utility decreases
-	OL_STAY,  // stay at current ratio
+	OL_START,  // stay at current ratio
 };
 
 struct ol_global {
@@ -825,12 +827,31 @@ static void ol_setup_intervals_moving(struct tcp_sock *tp)
 	struct ol_global *global = ol_p->global_data;
 
 	ol_p->intervals_data[0].red_ratio = ol_p->global_data->suggested_red_ratio;
-	ol_p->intervals_data[0].utility = max(ol_p->intervals_data[0].utility, ol_p->intervals_data[1].utility); /* for moving comparison*/
+	if(global->state == OL_PROBE) /* when switching from OL_PROBE to OL_MOVE, choose a higher utility for comparison */
+		ol_p->intervals_data[0].previous_utility = max(ol_p->intervals_data[0].utility, ol_p->intervals_data[1].utility); 
+	else /* when stay in OL_MOVE */
+		ol_p->intervals_data[0].previous_utility = ol_p->intervals_data[0].utility;
 
 	global->snd_idx = 0;
 	global->rcv_idx = 0;
 	global->waiting = false;
 	global->state = OL_MOVE;
+}
+
+/* follow the suggested ratio and setup one interval */
+static void ol_setup_intervals_starting(struct tcp_sock *tp)
+{
+	struct olsched_priv *ol_p;
+	ol_p = olsched_get_priv(tp);
+	struct ol_global *global = ol_p->global_data;
+
+	ol_p->intervals_data[0].red_ratio = ol_p->global_data->suggested_red_ratio;
+	ol_p->intervals_data[0].previous_utility = ol_p->intervals_data[0].utility; /* for comparison */
+
+	global->snd_idx = 0;
+	global->rcv_idx = 0;
+	global->waiting = false;
+	global->state = OL_START;
 }
 
 static u16 ol_suggest_ratio_probing(struct tcp_sock *tp)
@@ -850,19 +871,11 @@ static u16 ol_suggest_ratio_probing(struct tcp_sock *tp)
 	did_agree = !((run_1_res == run_2_res) ^
 				  (ol_p->intervals_data[0].red_ratio == ol_p->intervals_data[2].red_ratio)); 
 
-	if (did_agree) {/* set the suggested ratio later */
-		// global->previous_red_ratio = global->suggested_red_ratio;
-		// global->suggested_red_ratio = max(ol_p->intervals_data[2].red_ratio, ol_p->intervals_data[3].red_ratio);
-		// if (run_2_res) { 
-		// 	global->previous_red_ratio = global->suggested_red_ratio;
-		// 	global->suggested_red_ratio = ol_p->intervals_data[2].red_ratio;
-		// } else {
-		// 	global->previous_red_ratio = global->suggested_red_ratio;
-		// 	global->suggested_red_ratio = ol_p->intervals_data[3].red_ratio;
-		// }
+	if (did_agree) {
+		/* return the suggested ratio later */
 		return max(ol_p->intervals_data[2].red_ratio, ol_p->intervals_data[3].red_ratio);
 	} else {
-		// global->previous_red_ratio = global->suggested_red_ratio; /* no agreed result, keep the same suggested ratio */
+		/* no agreed result, return the same suggested ratio */
 		return global->suggested_red_ratio;
 	}
 }
@@ -875,16 +888,16 @@ static u32 ol_suggest_ratio_moving(struct tcp_sock *tp)
 	ol_p = olsched_get_priv(tp);
 	struct ol_global *global = ol_p->global_data;
 	struct ol_interval *interval = &ol_p->intervals_data[0];
-	s64 utility, prev_utility, grad;
+	s64 utility, previous_utility, grad;
 	s64 new_ratio, rate_change, step, min_step;
 
-	prev_utility = interval->utility;
+	previous_utility = interval->utility;
 	global->util_func(interval, sk);
 	utility = interval->utility;
 
 
-	grad = ol_calc_util_grad(global->suggested_red_ratio, utility, global->previous_red_ratio, prev_utility);
-	step = (grad * OLSCHED_GRAD_STEP_SIZE) >> OLSCHED_SCALE; /* gradient ascent */
+	grad = ol_calc_util_grad(global->suggested_red_ratio, utility, global->previous_red_ratio, previous_utility);
+	step = (grad * OLSCHED_GRAD_STEP) >> OLSCHED_SCALE; /* gradient ascent */
 	// pcc_update_step_params(pcc, step); /* may accelerate/decellerate changes */
 	// step *= pcc->amplifier; 
     // step /= PCC_SCALE;
@@ -893,14 +906,15 @@ static u32 ol_suggest_ratio_moving(struct tcp_sock *tp)
 	/* We need our step size to be large enough that we can compute the gradient
 	 * with low noise
 	 */
-	min_step = OLSCHED_GRAD_MIN_STEP_SIZE;
+	min_step = OLSCHED_GRAD_MIN_STEP;
 
 	if (step >= 0 && step < min_step)
 		step = min_step;
 	else if (step < 0 && step > -1 * min_step)
 		step = -1 * min_step;
 
-	new_ratio = max((s64)global->suggested_red_ratio + step, 0);
+	new_ratio = max((s64)global->suggested_red_ratio + step, OLSCHED_MIN_RED_RATIO);
+	new_ratio = min(new_ratio, OLSCHED_MAX_RED_RATIO);
 
 	printk(KERN_INFO "ytxing: tp %p OL_MOVE: grad %lld step %lld min_step %lld\n",
 		   tp, grad, step, min_step);
@@ -1058,7 +1072,7 @@ static void ol_moving_decide(struct sock *meta_sk, struct sock *sk)
 	ol_p = olsched_get_priv(tp);
 	struct ol_interval *interval;
 	struct ol_global *global = ol_p->global_data;
-	u16 new_ratio = ol_suggest_ratio_moving(sk, pcc);
+	u16 new_ratio = ol_suggest_ratio_moving(tp);
 	enum OL_MOVING_STATE previous_direction, curr_direction;
 
 	if (global->previous_red_ratio < global->suggested_red_ratio)
@@ -1075,6 +1089,8 @@ static void ol_moving_decide(struct sock *meta_sk, struct sock *sk)
 	else if (global->suggested_red_ratio > new_ratio)
 		curr_direction = OL_RATIO_DOWN;
 
+	global->previous_red_ratio = global->suggested_red_ratio;
+	global->suggested_red_ratio = new_ratio;
 	if (previous_direction != curr_direction) {
 		global->moving = false;
 		global->state = OL_PROBE;
@@ -1084,6 +1100,46 @@ static void ol_moving_decide(struct sock *meta_sk, struct sock *sk)
 		global->moving = true;
 		global->state = OL_MOVE;
 		ol_setup_intervals_moving(tp);
+	}
+
+	start_current_send_interval(tp);
+}
+
+/* Choose new direction and update state from the moving state.*/
+static void ol_starting_decide(struct sock *meta_sk, struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct olsched_priv *ol_p;
+	ol_p = olsched_get_priv(tp);
+	struct ol_interval *interval = ol_p->intervals_data[0];
+	struct ol_global *global = ol_p->global_data;
+	s64 utility, previous_utility, grad;
+
+	if (ol_p->global_data->state != OL_START){
+		printk(KERN_INFO "ytxing: BUG wrong state\n",
+		return;
+	}
+
+	/* try to use lower red_ratio for higher throughput at the beginning */
+	u16 new_ratio = max(global->suggested_red_ratio - OLSCHED_START_STEP, OLSCHED_MIN_RED_RATIO);
+
+	previous_utility = interval->utility;
+	(*global->util_func)(interval, sk);
+	utility = interval->utility;
+
+	global->previous_red_ratio = global->suggested_red_ratio;
+	global->suggested_red_ratio = new_ratio;
+	if (previous_utility > utility || new_ratio == OLSCHED_MIN_RED_RATIO) {
+		/* end starting state, enter OL_PROBE */
+		global->moving = false;
+		global->state = OL_PROBE;
+		ol_setup_intervals_probing(tp);
+
+	} else {
+		/* still in OL_START */
+		global->moving = false;
+		global->state = OL_START;
+		ol_setup_intervals_starting(tp);
 	}
 
 	start_current_send_interval(tp);
@@ -1100,7 +1156,7 @@ static void interval_process(struct ol_global *global, struct tcp_sock *tp)
 	// }
 	if ((global->snd_idx == OLSCHED_INTERVALS_NUM && global->state == OL_PROBE) 	/* all intervals stop sending in OL_PROBE */
 		|| (global->snd_idx == 1 && global->state == OL_MOVE) 						/* the only one interval stop sending in OL_MOVE */
-		|| (global->snd_idx == 1 && global->state == OL_STAY) {						/* the only one interval stop sending in OL_STAY */
+		|| (global->snd_idx == 1 && global->state == OL_START) {						/* the only one interval stop sending in OL_START */
 
 		global->waiting = true;
 		return;
@@ -1192,6 +1248,13 @@ static void update_interval_info_rcv(struct ol_global *global, struct tcp_sock *
 	}
 
 }
+
+/* was the ol struct fully inited */
+bool ol_valid(struct olsched_priv *ol_p)
+{
+	return (ol_p && ol_p->global_data && ol_p->intervals_data && ol_p->intervals_data[0].red_ratio);
+}
+
 /* Updates the OL model */
 static void ol_process(struct sock *meta_sk, struct sock *sk)
 {
@@ -1206,11 +1269,11 @@ static void ol_process(struct sock *meta_sk, struct sock *sk)
 	struct ol_interval *interval;
 
 	/* maybe some checking? */
-	// if (!ol_valid(ol_p))
-	// 	return;
+	if (!ol_valid(ol_p))
+		return;
 
 	/* handle interval in sending state */
-	if (!global->waiting == true) { 
+	if (global->waiting == false) { 
 		interval = &ol_p->intervals_data[global->snd_idx];
 		update_interval_info_snd(interval, tp);
 		if (ol_current_send_interval_ended(interval, tp)) {
@@ -1218,21 +1281,27 @@ static void ol_process(struct sock *meta_sk, struct sock *sk)
 		}
 	}
 
-	/* handle interval in receiving state */ //TODO 这里需要实时记录一些必要的数据在interval中
+	/* handle interval in receiving state */ 
 	update_interval_info_rcv(global, tp);
 	/* check if all intervals finish receiving */
 	if (all_receive_interval_ended(global, tp)){
 		/* decide new suggested ratio and OL_GLOBAL_STATE*/
 		if (global->state == OL_PROBE)
 			ol_probing_decide(meta_sk, sk);
-		else if(global->state == OL_MOVE)
+		else if (global->state == OL_MOVE)
 			ol_moving_decide(meta_sk, sk);
+		else if (global->state == OL_START)
+			ol_starting_decide(meta_sk, sk); // TODO
+		else 
+			printk(KERN_DEBUG "ytxing: tp %p has no valid OL_STATE\n", tcp_sk(sk));
 	}
 }
 
 static void olsched_release(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
+	
+	struct olsched_priv *ol_p = olsched_get_priv(tcp_sk(sk));
 	struct olsched_cb *ol_cb = olsched_get_cb(tp);
 
 	/* Check if the next subflow would be the released one. If yes correct
@@ -1240,6 +1309,9 @@ static void olsched_release(struct sock *sk)
 	 */
 	if (ol_cb->next_subflow == tp)
 		olsched_update_next_subflow(tp, ol_cb);
+
+	kfree(ol_p->intervals_data);
+	kfree(ol_p->global_data);
 }
 
 static void olsched_init(struct sock *sk)
@@ -1251,12 +1323,21 @@ static void olsched_init(struct sock *sk)
 				 GFP_KERNEL);
 	ol_p->global_data = kzalloc(sizeof(struct ol_global),
 				 GFP_KERNEL);
-	ol_p->global_data->red_ratio = OLSCHED_UNIT * OLSCHED_INIT_RED_RATIO;
+	ol_p->global_data->red_ratio = OLSCHED_INIT_RED_RATIO;
+	ol_p->global_data->suggested_red_ratio = OLSCHED_INIT_RED_RATIO; /* should be 1 */
+	ol_p->global_data->previous_red_ratio = OLSCHED_INIT_RED_RATIO;
+	ol_p->global_data->state = OL_START;
+	ol_p->global_data->waiting = false;
 	ol_p->global_data->red_quota = 0;
 	ol_p->global_data->new_quota = 0;
 	ol_p->global_data->util_func = &ol_calc_utility;
 
+	ol_p->intervals_data[0].utility = S64_MIN;
+	ol_p->intervals_data[0].previous_utility = S64_MIN;
+
 	/* first try to move from 0 -> 1, for throughput TODO */
+	ol_setup_intervals_starting(tcp_sk(sk));
+	start_current_send_interval(tcp_sk(sk));
 
 	printk(KERN_DEBUG "ytxing: olsched_init tp %p\n", tcp_sk(sk));
 	if(!tcp_is_sack)
