@@ -207,7 +207,7 @@ static u64 olsched_get_bandwidth(struct sock *sk)
 	bandwidth = (u64)tp->snd_cwnd * mss_now * USEC_PER_SEC;
 	do_div(bandwidth, rtt_us);
 		
-	// printk(KERN_DEBUG "ytxing: tp: %p bandwidth%llu rtt:%u(us) cwnd:%u\n", tp, bandwidth, rtt_us, tp->snd_cwnd);
+	// printk(KERN_DEBUG "ytxing: tp:%p bandwidth%llu rtt:%u(us) cwnd:%u\n", tp, bandwidth, rtt_us, tp->snd_cwnd);
 	return bandwidth; /* Bps */
 }
 
@@ -282,8 +282,6 @@ static void ol_setup_intervals_probing(struct tcp_sock *tp)
 			ol_p->intervals_data[i + 1].red_ratio = red_ratio_lo;
 		}
 
-		ol_p->intervals_data[i].index = i;
-		ol_p->intervals_data[i + 1].index = i + 1;
 	}
 
 	global->snd_idx = 0;
@@ -305,6 +303,7 @@ static void ol_setup_intervals_moving(struct tcp_sock *tp)
 		ol_p->intervals_data[0].previous_utility = max(ol_p->intervals_data[0].utility, ol_p->intervals_data[1].utility); 
 	else /* when stay in OL_MOVE */
 		ol_p->intervals_data[0].previous_utility = ol_p->intervals_data[0].utility;
+
 
 	global->snd_idx = 0;
 	global->rcv_idx = 0;
@@ -407,7 +406,10 @@ bool ol_current_send_interval_ended(struct ol_interval *interval, struct tcp_soc
 	if (tp->tcp_mstamp - interval->snd_time_begin < srtt_us * OLSCHED_INTERVALS_DURATION) 
 		return false;
 		
-	timeout = (tp->tcp_mstamp - interval->snd_time_begin) > srtt_us * OLSCHED_INTERVALS_TIMEOUT;
+	if (srtt_us)
+		timeout = (tp->tcp_mstamp - interval->snd_time_begin) > srtt_us * OLSCHED_INTERVALS_TIMEOUT;
+	else
+		timeout = false;
 	/* not enough packets out and not timeout */
 	if (packets_sent < OLSCHED_INTERVAL_MIN_PACKETS && !timeout)
 		return false;
@@ -418,7 +420,8 @@ bool ol_current_send_interval_ended(struct ol_interval *interval, struct tcp_soc
 	interval->snd_time_end = tp->tcp_mstamp;
 	interval->snd_timeout = timeout;
 	interval->snd_ended = true;
-	printk(KERN_INFO "ytxing: TIMEOUT\n");
+	printk(KERN_INFO "ytxing: tp:%p interval end packets_sent:%u timeout:%d\n", tp, packets_sent, timeout);
+	printk(KERN_INFO "ytxing: tp:%p interval end duration:%llu srtt_us:%u\n", tp, tp->tcp_mstamp - interval->snd_time_begin, srtt_us);
 	return true;
 }
 
@@ -428,6 +431,8 @@ bool ol_current_send_interval_ended(struct ol_interval *interval, struct tcp_soc
 bool recive_interval_ended(struct ol_interval *interval, struct tcp_sock *tp)
 {
 	u32 srtt_us = tp->srtt_us >> 3;
+	if (!srtt_us)
+		return false;
 	bool timeout;
 	if(interval->rcv_ended)
 		return true;
@@ -443,7 +448,7 @@ bool recive_interval_ended(struct ol_interval *interval, struct tcp_sock *tp)
 		interval->rcv_time_end = tp->tcp_mstamp;
 		interval->rcv_ended = true;
 		if(interval->snd_ended == false)
-			printk(KERN_DEBUG "ytxing: BUG tp: %p interval:%d rcv_timeout before snd_ended\n", tp, interval->index);
+			printk(KERN_DEBUG "ytxing: BUG tp:%p interval:%d rcv_timeout before snd_ended\n", tp, interval->index);
 		return true;
 	}
 
@@ -485,10 +490,15 @@ static void start_current_send_interval(struct tcp_sock *tp)
 	interval->pkts_out_begin = tp->data_segs_out; /* maybe? */
 	interval->known_seq = tp->snd_una; /* init known_seq as the next unacked seq, should be less than snd_next*/
 
+	interval->snd_ended = false;
+	interval->rcv_ended = false;
+	interval->snd_timeout = false;
+	interval->rcv_timeout = false;
 	/* when a interval is active, the global ratio is set to the interval's ratio */
 	global->red_ratio = interval->red_ratio; 
 
-	printk(KERN_DEBUG "ytxing: tp: %p start interval snd_idx: %u ratio: %u/1024\n", tp, interval->index, global->red_ratio >> 3);
+	printk(KERN_DEBUG "ytxing: tp:%p start interval snd_idx: %u ratio: %u/1024\n", tp, interval->index, global->red_ratio >> 3);
+	printk(KERN_DEBUG "ytxing: tp:%p start interval snd_idx: %u interval->snd_time_begin:%llu\n", tp, interval->index, interval->snd_time_begin);
 }
 
 
@@ -871,16 +881,22 @@ static void ol_process(struct sock *meta_sk, struct sock *sk)
 	/* handle interval in sending state */
 	if (global->waiting == false) { 
 		interval = &ol_p->intervals_data[global->snd_idx];
+		printk(KERN_DEBUG "ytxing: tp:%p update_interval_info_snd\n", tp);
 		update_interval_info_snd(interval, tp);
+		printk(KERN_DEBUG "ytxing: tp:%p ol_current_send_interval_ended\n", tp);
 		if (ol_current_send_interval_ended(interval, tp)) {
+			printk(KERN_DEBUG "ytxing: tp:%p interval_process\n", tp);
 			interval_process(global, tp);
 		}
 	}
 
 	/* handle interval in receiving state */ 
+	printk(KERN_DEBUG "ytxing: tp:%p update_interval_info_rcv\n", tp);
 	update_interval_info_rcv(global, tp);
 	/* check if all intervals finish receiving */
+	printk(KERN_DEBUG "ytxing: tp:%p all_receive_interval_ended\n", tp);
 	if (all_receive_interval_ended(global, tp)){
+		printk(KERN_DEBUG "ytxing: tp:%p decide\n", tp);
 		/* decide new suggested ratio and OL_GLOBAL_STATE*/
 		if (global->state == OL_PROBE)
 			ol_probing_decide(meta_sk, sk);
@@ -1275,7 +1291,7 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 		if (!sk)
 			break;
 		tp = tcp_sk(sk);
-		// printk(KERN_DEBUG "ytxing: better tp: %p srtt: %u\n", tp, (tp->srtt_us >> 3));
+		// printk(KERN_DEBUG "ytxing: better tp:%p srtt: %u\n", tp, (tp->srtt_us >> 3));
 		ol_p = olsched_get_priv(tp);
 		olsched_correct_skb_pointers(meta_sk, ol_p);
 
@@ -1322,7 +1338,7 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 		//			to a sk with longer rtt.
 		unavailable_sk = sk;
 	}
-	// printk(KERN_DEBUG "ytxing: tp: %p Nothing to send\n",  tp);
+	// printk(KERN_DEBUG "ytxing: tp:%p Nothing to send\n",  tp);
 
 	/* Nothing to send */
 	return NULL;
@@ -1348,6 +1364,7 @@ static void olsched_release(struct sock *sk)
 static void olsched_init(struct sock *sk)
 {
 	struct olsched_priv *ol_p = olsched_get_priv(tcp_sk(sk));
+	int i;
 	// struct olsched_cb *ol_cb = olsched_get_cb(tcp_sk(mptcp_meta_sk(sk)));
 
 	ol_p->intervals_data = kzalloc(sizeof(struct ol_interval) * OLSCHED_INTERVALS_NUM * 2,
@@ -1362,6 +1379,10 @@ static void olsched_init(struct sock *sk)
 	ol_p->global_data->red_quota = 0;
 	ol_p->global_data->new_quota = 0;
 	ol_p->global_data->util_func = &ol_calc_utility;
+
+	for (i = 0; i < OLSCHED_INTERVALS_NUM; i++){
+		ol_p->intervals_data[0].index = i;
+	}
 
 	ol_p->intervals_data[0].utility = S64_MIN;
 	ol_p->intervals_data[0].previous_utility = S64_MIN;
