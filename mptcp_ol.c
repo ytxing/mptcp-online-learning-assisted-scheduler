@@ -651,6 +651,7 @@ static void interval_process(struct ol_global *global, struct tcp_sock *tp)
 static void update_interval_info_snd(struct ol_interval *interval, struct tcp_sock *tp)
 {
 	interval->snd_seq_end = tp->snd_nxt;
+	printk(KERN_DEBUG "ytxing: tp:%p idx: %u snd_seq: %u->%u\n", tp, interval->index, interval->snd_seq_begin, interval->snd_seq_end);
 }
 
 /* ytxing:
@@ -744,7 +745,7 @@ static void olsched_check_quota(struct tcp_sock *tp,
 		return;
 	global->red_quota =  (tp->snd_cwnd * global->red_ratio) >> OLSCHED_SCALE;
 	global->new_quota = tp->snd_cwnd - global->red_quota;
-	printk(KERN_INFO "ytxing: tp %p red_quota %u new_quota %u ratio %u/1024\n", tp, global->red_quota, global->new_quota, global->red_ratio >> 3);
+	// printk(KERN_INFO "ytxing: tp %p red_quota %u new_quota %u ratio %u/1024\n", tp, global->red_quota, global->new_quota, global->red_ratio >> 3);
 }
 
 /* ytxing:
@@ -806,7 +807,7 @@ static u64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 	bw_item_f = fixedpt_fromint(bw_item);
 	bw_item_f = fixedpt_pow(bw_item_f, fixedpt_rconst(0.99));
 	bw_item = (bw_item_f >> FIXEDPT_FBITS); /* OLSCHED_ALPHA power TODO (does it work?*/;
-	printk(KERN_DEBUG "ytxing: tp:%p bw_item^0.99: %llu\n", curr_tp, bw_item);
+	// printk(KERN_DEBUG "ytxing: tp:%p bw_item^0.99: %llu\n", curr_tp, bw_item);
 
 	/* dRTT(ofo) item */
 	if(curr_tp->srtt_us == minRTT) {
