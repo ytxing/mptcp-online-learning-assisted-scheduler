@@ -99,10 +99,11 @@ struct ol_interval {
 	u64 previous_utility;
 
 	u8	snd_timeout:1,
-			snd_ended:1,
-			rcv_timeout:1,
-			rcv_ended:1,
-			unusued:4;
+		snd_ended:1,
+		rcv_timeout:1,
+		rcv_ended:1,
+		invalid_utility:1,
+		unusued:3;
 };
 
 enum OL_GLOBAL_STATE {
@@ -225,10 +226,22 @@ static u64 olsched_get_loss_rate(struct ol_interval *interval)
 
 	loss_rate = (interval->lost_end - interval->lost_begin) << OLSCHED_SCALE;
 	delivered = interval->delivered_end - interval->delivered_begin;
+	if (delivered == 0)
+		return 0;
 	do_div(loss_rate, delivered);
 	return loss_rate;
 }
 
+static bool olsched_check_utility_invalid(struct tcp_sock *tp)
+{
+	struct olsched_priv *ol_p = olsched_get_priv(tp);
+	struct ol_global *global = ol_p->global_data;
+
+	if(global->state == OL_MOVE || global->state == OL_START)
+		return ol_p->intervals_data[0].invalid_utility;
+	
+	return ol_p->intervals_data[0].invalid_utility || ol_p->intervals_data[1].invalid_utility || ol_p->intervals_data[2].invalid_utility || ol_p->intervals_data[3].invalid_utility;
+}
 
 /* Calculate the graident of utility w.r.t. sending rate, but only if the rates
  * are far enough apart for the measurment to have low noise.
@@ -487,8 +500,8 @@ static void ol_probing_decide(struct sock *meta_sk, struct sock *sk)
 	struct olsched_priv *ol_p = olsched_get_priv(tp);
 	struct ol_interval *interval;
 	struct ol_global *global = ol_p->global_data;
-
 	u32 new_ratio;
+	bool invalid_utility;
 
 	int i;
 
@@ -496,11 +509,12 @@ static void ol_probing_decide(struct sock *meta_sk, struct sock *sk)
 		interval = &ol_p->intervals_data[i];
 		(*ol_p->global_data->util_func)(interval, sk); /* utility is now in interval->utility */
 	}
+	invalid_utility = olsched_check_utility_invalid(tp);
 
 	new_ratio = ol_suggest_ratio_probing(tp); /* the ratio with highest utility in four intervals */
 
 	global->previous_suggested_red_ratio = global->suggested_red_ratio;
-	if (new_ratio != global->suggested_red_ratio) {
+	if (new_ratio != global->suggested_red_ratio && !invalid_utility) {
 		/* move in this direction (agreement achieved) */
 		global->suggested_red_ratio = new_ratio;
 		printk(KERN_INFO "ytxing: tp %p decide: new ratio %u (from %u)\n",
@@ -531,6 +545,8 @@ static void ol_moving_decide(struct sock *meta_sk, struct sock *sk)
 	struct ol_global *global = ol_p->global_data;
 	u16 new_ratio = ol_suggest_ratio_moving(tp);
 	enum OL_MOVING_STATE previous_direction, curr_direction;
+	bool invalid_utility;
+	invalid_utility = olsched_check_utility_invalid(tp);
 
 	if (global->previous_suggested_red_ratio < global->suggested_red_ratio)
 		previous_direction = OL_RATIO_UP;
@@ -548,7 +564,7 @@ static void ol_moving_decide(struct sock *meta_sk, struct sock *sk)
 
 	global->previous_suggested_red_ratio = global->suggested_red_ratio;
 	global->suggested_red_ratio = new_ratio;
-	if (previous_direction != curr_direction) {
+	if (previous_direction != curr_direction || invalid_utility) {
 		global->moving = false;
 		global->state = OL_PROBE;
 		ol_setup_intervals_probing(tp);
@@ -571,6 +587,7 @@ static void ol_starting_decide(struct sock *meta_sk, struct sock *sk)
 	struct ol_global *global = ol_p->global_data;
 	s64 utility, previous_utility;
 	u16 new_ratio;
+	bool invalid_utility;
 
 	if (ol_p->global_data->state != OL_START){
 		printk(KERN_INFO "ytxing: BUG wrong state\n");
@@ -583,10 +600,12 @@ static void ol_starting_decide(struct sock *meta_sk, struct sock *sk)
 	previous_utility = interval->utility;
 	(*global->util_func)(interval, sk);
 	utility = interval->utility;
+	
+	invalid_utility = olsched_check_utility_invalid(tp);
 
 	global->previous_suggested_red_ratio = global->suggested_red_ratio;
 	global->suggested_red_ratio = new_ratio;
-	if (previous_utility > utility || new_ratio == OLSCHED_MIN_RED_RATIO) {
+	if ((previous_utility > utility && !invalid_utility) || new_ratio == OLSCHED_MIN_RED_RATIO) {
 		/* end starting state, enter OL_PROBE */
 		global->moving = false;
 		global->state = OL_PROBE;
@@ -778,9 +797,9 @@ static u64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 	printk(KERN_DEBUG "ytxing: tp:%p bw_item: %llu\n", curr_tp, bw_item);
 
 	bw_item_f = fixedpt_fromint(bw_item);
-	bw_item_f = fixedpt_pow(bw_item_f, fixedpt_rconst(OLSCHED_ALPHA));
+	bw_item_f = fixedpt_pow(bw_item_f, fixedpt_rconst(0.99));
 	bw_item = (bw_item_f >> FIXEDPT_FBITS); /* OLSCHED_ALPHA power TODO (does it work?*/;
-	printk(KERN_DEBUG "ytxing: tp:%p bw_item^%f: %llu\n", curr_tp, OLSCHED_ALPHA, bw_item);
+	printk(KERN_DEBUG "ytxing: tp:%p bw_item^0.99: %llu\n", curr_tp, bw_item);
 
 	/* dRTT(ofo) item */
 	if(curr_tp->srtt_us == minRTT) {
@@ -788,13 +807,24 @@ static u64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 	}
 	else {
 		dRTT = (curr_tp->srtt_us - minRTT) << OLSCHED_SCALE;
-		do_div(dRTT, minRTT);
-		// dRTT = div_u64(dRTT, minRTT);
+		if (minRTT == 0){
+			printk(KERN_DEBUG "ytxing: tp:%p div_u64: dRTT %llu/minRTT %u\n", curr_tp, dRTT, minRTT);
+			curr_interval->utility = 0;
+			curr_interval->invalid_utility = 1;
+			return 0;
+		}
+		dRTT = div_u64(dRTT, minRTT);
 	}
 	ofo_item = (bw_item * dRTT) >> OLSCHED_SCALE;
 
 	/* loss item */
 	sent_bytes = curr_interval->snd_seq_end - curr_interval->snd_seq_begin;
+	if (sent_bytes == 0){
+		printk(KERN_DEBUG "ytxing: tp:%p div_u64: sent_bytes == 0\n", curr_tp);
+		curr_interval->utility = 0;
+		curr_interval->invalid_utility = 1;
+		return 0;
+	}
 	lost_bytes = curr_interval->lost_bytes;
 	loss_rate = div_u64(lost_bytes << OLSCHED_SCALE, sent_bytes);
 	loss_item = (bw_item * loss_rate) >> OLSCHED_SCALE; /* x loss_rate TODO*/
@@ -803,6 +833,7 @@ static u64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 	utility = bw_item + OLSCHED_BETA * ofo_item + OLSCHED_GAMMA * loss_item;
 
 	curr_interval->utility = utility;
+	curr_interval->invalid_utility = 0;
 	return utility;
 }
 
@@ -1325,6 +1356,7 @@ static void olsched_init(struct sock *sk)
 
 	ol_p->intervals_data[0].utility = S64_MIN;
 	ol_p->intervals_data[0].previous_utility = S64_MIN;
+	ol_p->intervals_data[0].invalid_utility = 0; // 1 which means this utility is not trustworthy
 
 	/* first try to move from 0 -> 1, for throughput TODO */
 	ol_setup_intervals_starting(tcp_sk(sk));
