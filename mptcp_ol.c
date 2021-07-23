@@ -523,7 +523,7 @@ static void ol_probing_decide(struct sock *meta_sk, struct sock *sk)
 
 		global->moving = true;
 		global->state = OL_MOVE;
-		printk(KERN_INFO "ytxing: OL_PROBE -> OL_MOVE\n");
+		printk(KERN_INFO "ytxing: tp:%p OL_PROBE -> OL_MOVE\n", tp);
 	    ol_setup_intervals_moving(tp);
 	} else {
 		/* or keep on probing (no agreement achieved) */
@@ -532,7 +532,7 @@ static void ol_probing_decide(struct sock *meta_sk, struct sock *sk)
 		
 		global->moving = false;
 		global->state = OL_PROBE;
-		printk(KERN_INFO "ytxing: OL_PROBE -> OL_PROBE\n");
+		printk(KERN_INFO "ytxing: tp:%p OL_PROBE -> OL_PROBE\n", tp);
 	    ol_setup_intervals_probing(tp);
 	}
 
@@ -570,13 +570,13 @@ static void ol_moving_decide(struct sock *meta_sk, struct sock *sk)
 	if (previous_direction != curr_direction || invalid_utility) {
 		global->moving = false;
 		global->state = OL_PROBE;
-		printk(KERN_INFO "ytxing: OL_MOVE -> OL_PROBE\n");
+		printk(KERN_INFO "ytxing: tp:%p OL_MOVE -> OL_PROBE\n", tp);
 		ol_setup_intervals_probing(tp);
 
 	} else {
 		global->moving = true;
 		global->state = OL_MOVE;
-		printk(KERN_INFO "ytxing: OL_MOVE -> OL_MOVE\n");
+		printk(KERN_INFO "ytxing: tp:%p OL_MOVE -> OL_MOVE\n", tp);
 		ol_setup_intervals_moving(tp);
 	}
 
@@ -614,14 +614,14 @@ static void ol_starting_decide(struct sock *meta_sk, struct sock *sk)
 		/* end starting state, enter OL_PROBE */
 		global->moving = false;
 		global->state = OL_PROBE;
-		printk(KERN_INFO "ytxing: OL_START -> OL_PROBE\n");
+		printk(KERN_INFO "ytxing: tp:%p OL_START -> OL_PROBE\n", tp);
 		ol_setup_intervals_probing(tp);
 
 	} else {
 		/* still in OL_START */
 		global->moving = false;
 		global->state = OL_START;
-		printk(KERN_INFO "ytxing: OL_START -> OL_START\n");
+		printk(KERN_INFO "ytxing: tp:%p OL_START -> OL_START\n", tp);
 		ol_setup_intervals_starting(tp);
 	}
 
@@ -744,7 +744,7 @@ static void olsched_check_quota(struct tcp_sock *tp,
 		return;
 	global->red_quota =  (tp->snd_cwnd * global->red_ratio) >> OLSCHED_SCALE;
 	global->new_quota = tp->snd_cwnd - global->red_quota;
-	printk(KERN_INFO "ytxing: tp %p red_quota %u new_quota %u ratio %u/255\n", tp, global->red_quota, global->new_quota, global->red_ratio);
+	printk(KERN_INFO "ytxing: tp %p red_quota %u new_quota %u ratio %u/1024\n", tp, global->red_quota, global->new_quota, global->red_ratio >> 3);
 }
 
 /* ytxing:
