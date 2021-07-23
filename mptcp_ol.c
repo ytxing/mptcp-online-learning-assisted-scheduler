@@ -418,6 +418,7 @@ bool ol_current_send_interval_ended(struct ol_interval *interval, struct tcp_soc
 	interval->snd_time_end = tp->tcp_mstamp;
 	interval->snd_timeout = timeout;
 	interval->snd_ended = true;
+	printk(KERN_INFO "ytxing: TIMEOUT\n");
 	return true;
 }
 
