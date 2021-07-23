@@ -182,7 +182,7 @@ static int olsched_get_active_valid_sks_num(struct sock *meta_sk)
 			active_valid_sks++;
 	}
 		
-	printk(KERN_DEBUG "ytxing: active_valid_sks: %d/%d\n", active_valid_sks, i);
+	// printk(KERN_DEBUG "ytxing: active_valid_sks: %d/%d\n", active_valid_sks, i);
 	return active_valid_sks;
 }
 
@@ -207,7 +207,7 @@ static u64 olsched_get_bandwidth(struct sock *sk)
 	bandwidth = (u64)tp->snd_cwnd * mss_now * USEC_PER_SEC;
 	do_div(bandwidth, rtt_us);
 		
-	printk(KERN_DEBUG "ytxing: tp: %p bandwidth%llu rtt:%u(us) cwnd:%u\n", tp, bandwidth, rtt_us, tp->snd_cwnd);
+	// printk(KERN_DEBUG "ytxing: tp: %p bandwidth%llu rtt:%u(us) cwnd:%u\n", tp, bandwidth, rtt_us, tp->snd_cwnd);
 	return bandwidth; /* Bps */
 }
 
@@ -487,6 +487,7 @@ static void start_current_send_interval(struct tcp_sock *tp)
 	/* when a interval is active, the global ratio is set to the interval's ratio */
 	global->red_ratio = interval->red_ratio; 
 
+	printk(KERN_DEBUG "ytxing: tp: %p start interval snd_idx: %u ratio: %u/1024\n", tp, interval->index, global->red_ratio >> 3);
 }
 
 
@@ -522,6 +523,7 @@ static void ol_probing_decide(struct sock *meta_sk, struct sock *sk)
 
 		global->moving = true;
 		global->state = OL_MOVE;
+		printk(KERN_INFO "ytxing: OL_PROBE -> OL_MOVE\n");
 	    ol_setup_intervals_moving(tp);
 	} else {
 		/* or keep on probing (no agreement achieved) */
@@ -530,6 +532,7 @@ static void ol_probing_decide(struct sock *meta_sk, struct sock *sk)
 		
 		global->moving = false;
 		global->state = OL_PROBE;
+		printk(KERN_INFO "ytxing: OL_PROBE -> OL_PROBE\n");
 	    ol_setup_intervals_probing(tp);
 	}
 
@@ -567,11 +570,13 @@ static void ol_moving_decide(struct sock *meta_sk, struct sock *sk)
 	if (previous_direction != curr_direction || invalid_utility) {
 		global->moving = false;
 		global->state = OL_PROBE;
+		printk(KERN_INFO "ytxing: OL_MOVE -> OL_PROBE\n");
 		ol_setup_intervals_probing(tp);
 
 	} else {
 		global->moving = true;
 		global->state = OL_MOVE;
+		printk(KERN_INFO "ytxing: OL_MOVE -> OL_MOVE\n");
 		ol_setup_intervals_moving(tp);
 	}
 
@@ -609,12 +614,14 @@ static void ol_starting_decide(struct sock *meta_sk, struct sock *sk)
 		/* end starting state, enter OL_PROBE */
 		global->moving = false;
 		global->state = OL_PROBE;
+		printk(KERN_INFO "ytxing: OL_START -> OL_PROBE\n");
 		ol_setup_intervals_probing(tp);
 
 	} else {
 		/* still in OL_START */
 		global->moving = false;
 		global->state = OL_START;
+		printk(KERN_INFO "ytxing: OL_START -> OL_START\n");
 		ol_setup_intervals_starting(tp);
 	}
 
@@ -1261,12 +1268,12 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 	unavailable_sk = NULL;
 	/* ytxing: in this loop we find a avaliable sk with rtt as short as possible*/
 	for(i = 0; i < active_valid_sks; i++){
-		printk(KERN_DEBUG "ytxing: i: %d/%d\n", i+1, active_valid_sks);
+		// printk(KERN_DEBUG "ytxing: i: %d/%d\n", i+1, active_valid_sks);
 		sk = get_shorter_rtt_subflow_with_selector(mpcb, unavailable_sk ,&subflow_is_active);
 		if (!sk)
 			break;
 		tp = tcp_sk(sk);
-		printk(KERN_DEBUG "ytxing: better tp: %p srtt: %u\n", tp, (tp->srtt_us >> 3));
+		// printk(KERN_DEBUG "ytxing: better tp: %p srtt: %u\n", tp, (tp->srtt_us >> 3));
 		ol_p = olsched_get_priv(tp);
 		olsched_correct_skb_pointers(meta_sk, ol_p);
 
