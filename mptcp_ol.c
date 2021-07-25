@@ -420,20 +420,21 @@ bool ol_current_send_interval_ended(struct ol_interval *interval, struct tcp_soc
 	interval->snd_time_end = tp->tcp_mstamp;
 	interval->snd_timeout = timeout;
 	interval->snd_ended = true;
-	printk(KERN_INFO "ytxing: tp:%p interval end packets_sent:%u timeout:%d\n", tp, packets_sent, timeout);
-	printk(KERN_INFO "ytxing: tp:%p interval end duration:%llu srtt_us:%u\n", tp, tp->tcp_mstamp - interval->snd_time_begin, srtt_us);
+	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END packets_sent:%u timeout:%d\n", tp, interval->index, packets_sent, timeout);
+	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END duration:%llu srtt_us:%u\n", tp, interval->index, tp->tcp_mstamp - interval->snd_time_begin, srtt_us);
 	return true;
 }
 
 /* Have we accounted for (acked or lost) enough of the packets that we sent to
  * calculate summary statistics?
  */
-bool recive_interval_ended(struct ol_interval *interval, struct tcp_sock *tp)
+bool receive_interval_ended(struct ol_interval *interval, struct tcp_sock *tp)
 {
 	u32 srtt_us = tp->srtt_us >> 3;
+	bool timeout;
 	if (!srtt_us)
 		return false;
-	bool timeout;
+
 	if(interval->rcv_ended)
 		return true;
 
@@ -441,8 +442,10 @@ bool recive_interval_ended(struct ol_interval *interval, struct tcp_sock *tp)
 		interval->rcv_ended = true;
 		return true;
 	}
-
-	timeout = (tp->tcp_mstamp - interval->rcv_time_begin) > srtt_us * OLSCHED_INTERVALS_TIMEOUT;
+	// timeout = (tp->tcp_mstamp - interval->rcv_time_begin) > srtt_us * OLSCHED_INTERVALS_TIMEOUT;
+	timeout = false; // not sure rcv interval needs timeout
+	
+	// printk(KERN_DEBUG "ytxing: BUG tp:%p receive_interval_ended tp->tcp_mstamp%llu - interval->rcv_time_begin%llu\n", tp, tp->tcp_mstamp, interval->rcv_time_begin);
 	if(timeout){
 		interval->rcv_timeout = timeout;
 		interval->rcv_time_end = tp->tcp_mstamp;
@@ -462,14 +465,14 @@ bool all_receive_interval_ended(struct ol_global *global, struct tcp_sock *tp)
 
 	/* OL_MOVE only use one interval */
 	if(global->state == OL_MOVE || global->state == OL_START)
-		return recive_interval_ended(&ol_p->intervals_data[0], tp);
+		return receive_interval_ended(&ol_p->intervals_data[0], tp);
 
 	/* if not all intervals stop sending, then return false */
 	if(global->snd_idx < OLSCHED_INTERVALS_NUM - 1)
 		return false;
 
 	for(i = 0; i < OLSCHED_INTERVALS_NUM; i++){
-		if(!recive_interval_ended(&ol_p->intervals_data[i], tp)){
+		if(!receive_interval_ended(&ol_p->intervals_data[i], tp)){
 			return false;
 		}
 	}
@@ -662,7 +665,11 @@ static void interval_process(struct ol_global *global, struct tcp_sock *tp)
 static void update_interval_info_snd(struct ol_interval *interval, struct tcp_sock *tp)
 {
 	interval->snd_seq_end = tp->snd_nxt;
-	printk(KERN_DEBUG "ytxing: tp:%p idx: %u snd_seq: %u->%u\n", tp, interval->index, interval->snd_seq_begin, interval->snd_seq_end);
+
+	if(interval->snd_time_begin == 0)
+		interval->snd_time_begin = tp->tcp_mstamp;
+
+	// printk(KERN_DEBUG "ytxing: tp:%p idx: %u snd_seq: %u->%u(%u)\n", tp, interval->index, interval->snd_seq_begin, interval->snd_seq_end, interval->snd_seq_end - interval->snd_seq_begin);
 }
 
 /* ytxing:
@@ -729,12 +736,15 @@ static void update_interval_info_rcv(struct ol_global *global, struct tcp_sock *
 		}
 		/* ytxing: if this interval just start receiving pkts for the first time */
         if (before(current_interval_known_seq, interval->snd_seq_begin) && !before(interval->known_seq, interval->snd_seq_begin)) {
+		// if (interval->rcv_time_begin == 0) {
             interval->rcv_time_begin = tp->tcp_mstamp;
         }
+		
 		/* ytxing: if the interval has seen all sent packets and finished sending */
         if (interval->snd_ended && before(current_interval_known_seq, interval->snd_seq_end) && !before(interval->known_seq, interval->snd_seq_end)) {
             interval->rcv_time_end = tp->tcp_mstamp;
 			interval->rcv_ended = true;
+			printk(KERN_DEBUG "ytxing: tp:%p idx:%u RCV END sent:%u lost:%u\n", tp, interval->index, interval->snd_seq_end - interval->snd_seq_begin, interval->lost_bytes);
 			// interval->delivered_end = tp->delivered; /* sure? delivered is not reliable with sack since it might contain some pkts of other intervals*/
         }
 
@@ -807,7 +817,7 @@ static u64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 		ol_p = olsched_get_priv(tp);
 		ratio_t = ol_p->global_data->suggested_red_ratio;
 		bw_t = olsched_get_bandwidth(sk); 
-		others_bw = (1 - ratio_t) * bw_t; /* ytxing: (1 - ratio_t), be careful */
+		others_bw = (OLSCHED_UNIT - ratio_t) * bw_t; /* ytxing: (1 - ratio_t), be careful */
 	}
 
 	/* bandwidth item */
@@ -881,22 +891,22 @@ static void ol_process(struct sock *meta_sk, struct sock *sk)
 	/* handle interval in sending state */
 	if (global->waiting == false) { 
 		interval = &ol_p->intervals_data[global->snd_idx];
-		printk(KERN_DEBUG "ytxing: tp:%p update_interval_info_snd\n", tp);
+		// printk(KERN_DEBUG "ytxing: tp:%p update_interval_info_snd\n", tp);
 		update_interval_info_snd(interval, tp);
-		printk(KERN_DEBUG "ytxing: tp:%p ol_current_send_interval_ended\n", tp);
 		if (ol_current_send_interval_ended(interval, tp)) {
-			printk(KERN_DEBUG "ytxing: tp:%p interval_process\n", tp);
+			// printk(KERN_DEBUG "ytxing: tp:%p ol_current_send_interval_ended\n", tp);
 			interval_process(global, tp);
+			// printk(KERN_DEBUG "ytxing: tp:%p interval_process\n", tp);
 		}
 	}
 
 	/* handle interval in receiving state */ 
-	printk(KERN_DEBUG "ytxing: tp:%p update_interval_info_rcv\n", tp);
 	update_interval_info_rcv(global, tp);
+	// printk(KERN_DEBUG "ytxing: tp:%p update_interval_info_rcv\n", tp);
 	/* check if all intervals finish receiving */
-	printk(KERN_DEBUG "ytxing: tp:%p all_receive_interval_ended\n", tp);
 	if (all_receive_interval_ended(global, tp)){
-		printk(KERN_DEBUG "ytxing: tp:%p decide\n", tp);
+		// printk(KERN_DEBUG "ytxing: tp:%p all_receive_interval_ended\n", tp);
+		// printk(KERN_DEBUG "ytxing: tp:%p decide\n", tp);
 		/* decide new suggested ratio and OL_GLOBAL_STATE*/
 		if (global->state == OL_PROBE)
 			ol_probing_decide(meta_sk, sk);
@@ -1381,7 +1391,7 @@ static void olsched_init(struct sock *sk)
 	ol_p->global_data->util_func = &ol_calc_utility;
 
 	for (i = 0; i < OLSCHED_INTERVALS_NUM; i++){
-		ol_p->intervals_data[0].index = i;
+		ol_p->intervals_data[i].index = i;
 	}
 
 	ol_p->intervals_data[0].utility = S64_MIN;
