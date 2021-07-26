@@ -95,8 +95,8 @@ struct ol_interval {
 	u32 lost_end; 			/*pkts*/
 	u32 lost_bytes;
 
-	u64 utility;
-	u64 previous_utility;
+	s64 utility;
+	s64 previous_utility;
 
 	u8	snd_timeout:1,
 		snd_ended:1,
@@ -127,9 +127,12 @@ struct ol_global {
 		moving:1,	// ytxing: ture if olsched move toward one direction, stop when utility decreases
 		unused:7;
 	
-	u64 (*util_func)(struct ol_interval *, struct sock *);	//ytxing: the interval to calculate the utility and the sk of the interval
+	s64 (*util_func)(struct ol_interval *, struct sock *);	//ytxing: the interval to calculate the utility and the sk of the interval
 
 	enum OL_GLOBAL_STATE state;
+
+	/* for debug */
+	u32 round;
 };
 
 /* Struct to store the data of a single subflow */
@@ -200,7 +203,7 @@ static u64 olsched_get_bandwidth(struct sock *sk)
 	if (tp->srtt_us) {		/* any RTT sample yet? */
 		rtt_us = max(tp->srtt_us >> 3, 1U);
 	} else {			 /* no RTT sample yet */
-		rtt_us = USEC_PER_MSEC;	 /* use nominal default RTT ytxing maybe TODO */
+		return 0;
 	}
 	
 	mss_now = tcp_current_mss(sk);
@@ -373,6 +376,12 @@ static u32 ol_suggest_ratio_moving(struct tcp_sock *tp)
 
 
 	grad = ol_calc_util_grad(global->suggested_red_ratio, utility, global->previous_suggested_red_ratio, previous_utility);
+	if (grad == 0){	
+		printk(KERN_INFO "ytxing: tp %p OL_MOVE: grad %lld stay\n",
+		   tp, grad);
+		return global->suggested_red_ratio;
+	}
+
 	grad_abs = abs(grad);
 	grad_sign = grad >= 0 ? 1 : -1; 
 	step_abs = (grad_abs * OLSCHED_GRAD_STEP);  /* gradient ascent */
@@ -528,22 +537,18 @@ static void ol_probing_decide(struct sock *meta_sk, struct sock *sk)
 
 	new_ratio = ol_suggest_ratio_probing(tp); /* the ratio with highest utility in four intervals */
 
+	printk(KERN_INFO "ytxing: tp %p red_ratio %u (from %u)\n", tp, new_ratio >> 3, global->suggested_red_ratio >> 3);
+
 	global->previous_suggested_red_ratio = global->suggested_red_ratio;
 	if (new_ratio != global->suggested_red_ratio && !invalid_utility) {
 		/* move in this direction (agreement achieved) */
 		global->suggested_red_ratio = new_ratio;
-		printk(KERN_INFO "ytxing: tp %p decide: new ratio %u (from %u)\n",
-			   tp, new_ratio, global->suggested_red_ratio);
-
 		global->moving = true;
 		global->state = OL_MOVE;
 		printk(KERN_INFO "ytxing: tp:%p OL_PROBE -> OL_MOVE\n", tp);
 	    ol_setup_intervals_moving(tp);
 	} else {
 		/* or keep on probing (no agreement achieved) */
-		printk(KERN_INFO "ytxing: tp %p decide: stay ratio %u (from %u)\n",
-			   tp, new_ratio, global->suggested_red_ratio);
-		
 		global->moving = false;
 		global->state = OL_PROBE;
 		printk(KERN_INFO "ytxing: tp:%p OL_PROBE -> OL_PROBE\n", tp);
@@ -579,6 +584,7 @@ static void ol_moving_decide(struct sock *meta_sk, struct sock *sk)
 	else if (global->suggested_red_ratio > new_ratio)
 		curr_direction = OL_RATIO_DOWN;
 
+	printk(KERN_INFO "ytxing: tp:%p red_ratio %u->%u->%u (/1024)\n", tp, global->previous_suggested_red_ratio >> 3, global->suggested_red_ratio >> 3, new_ratio >> 3);
 	global->previous_suggested_red_ratio = global->suggested_red_ratio;
 	global->suggested_red_ratio = new_ratio;
 	if (previous_direction != curr_direction || invalid_utility) {
@@ -622,6 +628,8 @@ static void ol_starting_decide(struct sock *meta_sk, struct sock *sk)
 	
 	invalid_utility = olsched_check_utility_invalid(tp);
 
+	printk(KERN_INFO "ytxing: tp:%p previous_utility:%lld utility:%lld\n", tp, previous_utility, utility);
+	printk(KERN_INFO "ytxing: tp:%p new_ratio:%u old_ratio:%u\n", tp, new_ratio >> 3, global->suggested_red_ratio >> 3);
 	global->previous_suggested_red_ratio = global->suggested_red_ratio;
 	global->suggested_red_ratio = new_ratio;
 	if ((previous_utility > utility && !invalid_utility) || new_ratio == OLSCHED_MIN_RED_RATIO) {
@@ -779,7 +787,7 @@ static void olsched_check_quota(struct tcp_sock *tp,
 #define FIXEDPT_WBITS 40
 #define OMIT_STDINT
 #include "fixedptc.h"
-static u64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_sk) {
+static s64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_sk) {
 	struct sock *meta_sk = mptcp_meta_sk(curr_sk);
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk), *curr_tp = tcp_sk(curr_sk);	
 	struct mptcp_tcp_sock *mptcp;
@@ -790,9 +798,13 @@ static u64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 	u64 others_bw, curr_bw, dRTT /* ((curr_rtt - minRTT) << OLSCHED_SCALE / minRTT) */;
 	u32 ratio_t, minRTT = 0xFFFFFFFF;
 
-	u64 bw_item, bw_item_f, ofo_item, loss_rate, loss_item, utility;
+	u64 bw_item, bw_item_f, ofo_item, loss_rate, loss_item;
+	s64 utility;
 	u32 sent_bytes;
 	u64 lost_bytes;
+
+
+	printk(KERN_DEBUG "ytxing: tp:%p idx:%u UTIL CAL\n", curr_tp, curr_interval->index);
 
 	/* ytxing:	in this loop, we 
 	 *			1. calculate the ratio*bandwidth of other subflows 
@@ -822,8 +834,8 @@ static u64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 
 	/* bandwidth item */
 	curr_bw = olsched_get_bandwidth(curr_sk);
-	bw_item = others_bw + curr_bw * curr_ol_p->global_data->suggested_red_ratio;
-	printk(KERN_DEBUG "ytxing: tp:%p bw_item: %llu\n", curr_tp, bw_item);
+	bw_item = others_bw + curr_bw * (OLSCHED_UNIT - curr_ol_p->global_data->suggested_red_ratio);
+	printk(KERN_DEBUG "ytxing: tp:%p bw_item:%llu\n", curr_tp, bw_item);
 
 	bw_item_f = fixedpt_fromint(bw_item);
 	bw_item_f = fixedpt_pow(bw_item_f, fixedpt_rconst(0.99));
@@ -837,29 +849,34 @@ static u64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 	else {
 		dRTT = (curr_tp->srtt_us - minRTT) << OLSCHED_SCALE;
 		if (minRTT == 0){
-			printk(KERN_DEBUG "ytxing: tp:%p div_u64: dRTT %llu/minRTT %u\n", curr_tp, dRTT, minRTT);
+			printk(KERN_DEBUG "ytxing: tp:%p UTILI:0 div_u64: dRTT %llu/minRTT %u\n", curr_tp, dRTT, minRTT);
 			curr_interval->utility = 0;
 			curr_interval->invalid_utility = 1;
 			return 0;
 		}
 		dRTT = div_u64(dRTT, minRTT);
 	}
+	
+	printk(KERN_DEBUG "ytxing: tp:%p idx:%u dRTT:%llu/1024:\n", curr_tp, curr_interval->index, dRTT >> 3);
 	ofo_item = (bw_item * dRTT) >> OLSCHED_SCALE;
 
 	/* loss item */
 	sent_bytes = curr_interval->snd_seq_end - curr_interval->snd_seq_begin;
 	if (sent_bytes == 0){
-		printk(KERN_DEBUG "ytxing: tp:%p div_u64: sent_bytes == 0\n", curr_tp);
+		printk(KERN_DEBUG "ytxing: tp:%p UTILI:0 div_u64: sent_bytes == 0\n", curr_tp);
 		curr_interval->utility = 0;
 		curr_interval->invalid_utility = 1;
 		return 0;
 	}
 	lost_bytes = curr_interval->lost_bytes;
 	loss_rate = div_u64(lost_bytes << OLSCHED_SCALE, sent_bytes);
+	printk(KERN_DEBUG "ytxing: tp:%p idx:%u loss_rate:%llu/1024:\n", curr_tp, curr_interval->index, loss_rate >> 3);
 	loss_item = (bw_item * loss_rate) >> OLSCHED_SCALE; /* x loss_rate TODO*/
 
 	/* finally, the utility function */
-	utility = bw_item + OLSCHED_BETA * ofo_item + OLSCHED_GAMMA * loss_item;
+	utility = bw_item - OLSCHED_BETA * ofo_item - OLSCHED_GAMMA * loss_item;
+	
+	printk(KERN_DEBUG "ytxing: tp:%p idx:%u utility:%lld = bw_item:%llu - b*ofo_item:%llu - c*loss_item:%llu\n", curr_tp, curr_interval->index, utility, bw_item, ofo_item, loss_item);
 
 	curr_interval->utility = utility;
 	curr_interval->invalid_utility = 0;
@@ -1396,15 +1413,17 @@ static void olsched_init(struct sock *sk)
 
 	ol_p->intervals_data[0].utility = S64_MIN;
 	ol_p->intervals_data[0].previous_utility = S64_MIN;
-	ol_p->intervals_data[0].invalid_utility = 0; // 1 which means this utility is not trustworthy
+	ol_p->intervals_data[0].invalid_utility = 0; // 1 means this utility is not trustworthy, 0 otherwise
+
+	ol_p->global_data->round = 0;
 
 	/* first try to move from 0 -> 1, for throughput TODO */
 	ol_setup_intervals_starting(tcp_sk(sk));
 	start_current_send_interval(tcp_sk(sk));
 
-	printk(KERN_DEBUG "ytxing: olsched_init tp %p\n", tcp_sk(sk));
+	printk(KERN_DEBUG "ytxing: olsched_init tp:%p\n", tcp_sk(sk));
 	if(!tcp_is_sack(tcp_sk(sk)))
-		printk(KERN_DEBUG "ytxing: olsched_init tp %p is not sack, maybe bad.\n", tcp_sk(sk));
+		printk(KERN_DEBUG "ytxing: olsched_init tp:%p is not sack, maybe bad.\n", tcp_sk(sk));
 }
 
 static struct mptcp_sched_ops mptcp_sched_ol = {
