@@ -40,7 +40,7 @@ typedef __s64 s64;
 #define OLSCHED_MAX_RED_RATIO OLSCHED_UNIT
 #define OLSCHED_MIN_RED_RATIO 0
 #define OLSCHED_INIT_RED_RATIO (1 * OLSCHED_UNIT)
-#define OLSCHED_PROBING_EPSILON (OLSCHED_UNIT >> 7)
+#define OLSCHED_PROBING_EPSILON (OLSCHED_UNIT >> 4)
 #define OLSCHED_GRAD_NOISE (OLSCHED_UNIT >> 10)
 #define OLSCHED_GRAD_STEP (OLSCHED_UNIT >> 7)
 #define OLSCHED_GRAD_MIN_STEP (OLSCHED_UNIT >> 4)
@@ -214,6 +214,23 @@ static u64 olsched_get_bandwidth(struct sock *sk)
 	return bandwidth; /* Bps */
 }
 
+/* ytxing:	1. bandwidth = cwnd * mss / rtt 
+ *			2. bandwidth = delivered_byte / time_interval
+ *			in Bps
+ */
+static u64 olsched_get_bandwidth_interval(struct ol_interval *interval)
+{
+	u64 bandwidth;
+	u64 byte_rcv = interval->snd_seq_end - interval->snd_seq_begin - interval->lost_bytes;
+	u64 duration = interval->rcv_time_end - interval->rcv_time_begin; 
+
+	bandwidth = byte_rcv * USEC_PER_SEC;
+	do_div(bandwidth, duration);
+		
+	// printk(KERN_DEBUG "ytxing: tp:%p bandwidth%llu rtt:%u(us) cwnd:%u\n", tp, bandwidth, rtt_us, tp->snd_cwnd);
+	return bandwidth; /* Bps */
+}
+
 /* ytxing:	
  * get the loss rate of the sk, make sure this interval is COMPLETED		
  * in (0, 1) << OLSCHED_SCALE
@@ -253,6 +270,7 @@ static bool olsched_check_utility_invalid(struct tcp_sock *tp)
 static s64 ol_calc_util_grad(s64 ratio_1, s64 util_1, s64 ratio_2, s64 util_2) {
 	s64 rate_diff_ratio = (OLSCHED_UNIT * (ratio_2 - ratio_1)) / ratio_1;
 	if (abs(rate_diff_ratio) < OLSCHED_UNIT * OLSCHED_GRAD_NOISE)
+		printk(KERN_INFO "ytxing: UTIL GRAD too little difference\n");
 		return 0;
 
 	return (OLSCHED_UNIT * OLSCHED_UNIT * (util_2 - util_1)) / (ratio_2 - ratio_1); /* ratio << OLSCHED_SCALE, and this grad needs << OLSCHED too */
@@ -349,7 +367,7 @@ static u16 ol_suggest_ratio_probing(struct tcp_sock *tp)
 
 	if (did_agree) {
 		/* return the suggested ratio later */
-		return max(ol_p->intervals_data[2].red_ratio, ol_p->intervals_data[3].red_ratio);
+		return run_2_res ? ol_p->intervals_data[2].red_ratio : ol_p->intervals_data[3].red_ratio;
 	} else {
 		/* no agreed result, return the same suggested ratio */
 		return global->suggested_red_ratio;
@@ -752,7 +770,7 @@ static void update_interval_info_rcv(struct ol_global *global, struct tcp_sock *
         if (interval->snd_ended && before(current_interval_known_seq, interval->snd_seq_end) && !before(interval->known_seq, interval->snd_seq_end)) {
             interval->rcv_time_end = tp->tcp_mstamp;
 			interval->rcv_ended = true;
-			printk(KERN_DEBUG "ytxing: tp:%p idx:%u RCV END sent:%u lost:%u\n", tp, interval->index, interval->snd_seq_end - interval->snd_seq_begin, interval->lost_bytes);
+			printk(KERN_DEBUG "ytxing: tp:%p idx:%u RCV END sent:%u lost:%u known:%u\n", tp, interval->index, interval->snd_seq_end - interval->snd_seq_begin, interval->lost_bytes, interval->known_seq);
 			// interval->delivered_end = tp->delivered; /* sure? delivered is not reliable with sack since it might contain some pkts of other intervals*/
         }
 
@@ -792,10 +810,10 @@ static s64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk), *curr_tp = tcp_sk(curr_sk);	
 	struct mptcp_tcp_sock *mptcp;
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
-	struct olsched_priv *curr_ol_p = olsched_get_priv(curr_tp);
+	// struct olsched_priv *curr_ol_p = olsched_get_priv(curr_tp);
 	// struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
 
-	u64 others_bw, curr_bw, dRTT /* ((curr_rtt - minRTT) << OLSCHED_SCALE / minRTT) */;
+	u64 others_bw = 0, curr_bw, dRTT /* ((curr_rtt - minRTT) << OLSCHED_SCALE / minRTT) */;
 	u32 ratio_t, minRTT = 0xFFFFFFFF;
 
 	u64 bw_item, bw_item_f, ofo_item, loss_rate, loss_item;
@@ -827,15 +845,17 @@ static s64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 			continue;
 
 		ol_p = olsched_get_priv(tp);
-		ratio_t = ol_p->global_data->suggested_red_ratio;
+		ratio_t = ol_p->global_data->suggested_red_ratio; /* use global ratio for others */
 		bw_t = olsched_get_bandwidth(sk); 
-		others_bw = (OLSCHED_UNIT - ratio_t) * bw_t; /* ytxing: (1 - ratio_t), be careful */
+		others_bw += (OLSCHED_UNIT - ratio_t) * bw_t; /* ytxing: (1 - ratio_t), be careful */
+		// printk(KERN_DEBUG "ytxing: tp:%p another (OLSCHED_UNIT - ratio_t) * bw_t:%llu\n", curr_tp, (OLSCHED_UNIT - ratio_t) * bw_t);
 	}
 
 	/* bandwidth item */
 	curr_bw = olsched_get_bandwidth(curr_sk);
-	bw_item = others_bw + curr_bw * (OLSCHED_UNIT - curr_ol_p->global_data->suggested_red_ratio);
-	printk(KERN_DEBUG "ytxing: tp:%p bw_item:%llu\n", curr_tp, bw_item);
+	// printk(KERN_DEBUG "ytxing: tp:%p idx:%u curr_bw:%llu\n", curr_tp, curr_interval->index, curr_bw);
+	bw_item = others_bw + curr_bw * (OLSCHED_UNIT - curr_interval->red_ratio); /* use interval ratio for current tp */
+	printk(KERN_DEBUG "ytxing: tp:%p idx:%u bw_item:%llu curr_red_ratio:%u\n", curr_tp, curr_interval->index, bw_item, curr_interval->red_ratio >> 3);
 
 	bw_item_f = fixedpt_fromint(bw_item);
 	bw_item_f = fixedpt_pow(bw_item_f, fixedpt_rconst(0.99));
@@ -857,7 +877,7 @@ static s64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 		dRTT = div_u64(dRTT, minRTT);
 	}
 	
-	printk(KERN_DEBUG "ytxing: tp:%p idx:%u dRTT:%llu/1024:\n", curr_tp, curr_interval->index, dRTT >> 3);
+	printk(KERN_DEBUG "ytxing: tp:%p idx:%u dRTT:%llu/1024\n", curr_tp, curr_interval->index, dRTT >> 3);
 	ofo_item = (bw_item * dRTT) >> OLSCHED_SCALE;
 
 	/* loss item */
@@ -870,7 +890,7 @@ static s64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 	}
 	lost_bytes = curr_interval->lost_bytes;
 	loss_rate = div_u64(lost_bytes << OLSCHED_SCALE, sent_bytes);
-	printk(KERN_DEBUG "ytxing: tp:%p idx:%u loss_rate:%llu/1024:\n", curr_tp, curr_interval->index, loss_rate >> 3);
+	printk(KERN_DEBUG "ytxing: tp:%p idx:%u loss_rate:%llu/1024\n", curr_tp, curr_interval->index, loss_rate >> 3);
 	loss_item = (bw_item * loss_rate) >> OLSCHED_SCALE; /* x loss_rate TODO*/
 
 	/* finally, the utility function */
