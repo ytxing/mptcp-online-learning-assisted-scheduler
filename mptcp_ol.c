@@ -38,7 +38,7 @@ typedef __s64 s64;
 #define OLSCHED_SCALE 13
 #define OLSCHED_UNIT (1 << OLSCHED_SCALE)
 #define OLSCHED_MAX_RED_RATIO OLSCHED_UNIT
-#define OLSCHED_MIN_RED_RATIO 0
+#define OLSCHED_MIN_RED_RATIO 1
 #define OLSCHED_INIT_RED_RATIO (1 * OLSCHED_UNIT)
 #define OLSCHED_PROBING_EPSILON (OLSCHED_UNIT >> 3)
 #define OLSCHED_GRAD_NOISE (OLSCHED_UNIT >> 10)
@@ -381,9 +381,11 @@ static u16 ol_suggest_ratio_probing(struct tcp_sock *tp)
 
 	if (did_agree) {
 		/* return the suggested ratio later */
+		printk(KERN_INFO "ytxing: tp:%p OL_PROBE achievement agreed\n", tp);
 		return run_2_res ? ol_p->intervals_data[2].red_ratio : ol_p->intervals_data[3].red_ratio;
 	} else {
 		/* no agreed result, return the same suggested ratio */
+		printk(KERN_INFO "ytxing: tp:%p OL_PROBE no achievement, probe again\n", tp);
 		return global->suggested_red_ratio;
 	}
 }
@@ -929,11 +931,7 @@ static s64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 /* was the ol struct fully inited */
 bool ol_valid(struct olsched_priv *ol_p)
 {	
-	// printk(KERN_DEBUG "ytxing: ol_p->global_data->init == 1 %d\n", ol_p->global_data->init == 1);
 	return (ol_p && ol_p->global_data && ol_p->intervals_data && ol_p->global_data->init == 1 && ol_p->intervals_data[0].init == 1);
-	// printk(KERN_DEBUG "ytxing: ol_p%p && ol_p->global_data%p && ol_p->intervals_data%p && ol_p->global_data->init == %d %d\n", ol_p, ol_p->intervals_data, ol_p->global_data, ol_p->intervals_data, ol_p->global_data->init == 1);
-	// return (ol_p && ol_p->global_data && ol_p->intervals_data && ol_p->intervals_data[0].red_ratio);
-
 }
 
 /* Updates the OL model */
