@@ -31,7 +31,7 @@ typedef __s32 s32;
 typedef __s64 s64;
 
 #define OLSCHED_INTERVALS_NUM 4
-#define OLSCHED_INTERVALS_DURATION 1 /* OLSCHED_INTERVALS_DURATION * srtt_us */
+#define OLSCHED_INTERVALS_DURATION 3/2 /* OLSCHED_INTERVALS_DURATION * srtt_us */
 #define OLSCHED_INTERVALS_TIMEOUT 10 /* OLSCHED_INTERVALS_TIMEOUT * srtt_us */
 #define OLSCHED_INTERVAL_MIN_PACKETS 10
 
@@ -40,10 +40,10 @@ typedef __s64 s64;
 #define OLSCHED_MAX_RED_RATIO OLSCHED_UNIT
 #define OLSCHED_MIN_RED_RATIO 1
 #define OLSCHED_INIT_RED_RATIO (1 * OLSCHED_UNIT)
-#define OLSCHED_PROBING_EPSILON (OLSCHED_UNIT >> 3)
-#define OLSCHED_GRAD_NOISE (OLSCHED_UNIT >> 10)
-#define OLSCHED_GRAD_STEP (OLSCHED_UNIT >> 6)
-#define OLSCHED_GRAD_MIN_STEP (OLSCHED_UNIT >> 3)
+#define OLSCHED_PROBING_EPSILON (OLSCHED_UNIT >> (OLSCHED_SCALE - 10))
+#define OLSCHED_GRAD_NOISE (OLSCHED_UNIT >> (OLSCHED_SCALE - 3))
+#define OLSCHED_GRAD_STEP 1/1000
+#define OLSCHED_GRAD_MIN_STEP (OLSCHED_UNIT >> 4)
 #define OLSCHED_START_STEP (OLSCHED_UNIT >> 3)
 
 
@@ -287,7 +287,7 @@ static s64 ol_calc_util_grad(s64 ratio_1, s64 util_1, s64 ratio_2, s64 util_2) {
 		return 0;
 	}
 	printk(KERN_INFO "ytxing: util_2%lld util_1%lld\n", util_2, util_1);
-	return (OLSCHED_UNIT * OLSCHED_UNIT * (util_2 - util_1)) / (ratio_2 - ratio_1); /* ratio << OLSCHED_SCALE, and this grad needs << OLSCHED too */
+	return (OLSCHED_UNIT * (util_2 - util_1)) / (ratio_2 - ratio_1); /* ratio << OLSCHED_SCALE */
 }
 
 /* tweak the suggested ratio and setup four intervals */
@@ -381,11 +381,11 @@ static u16 ol_suggest_ratio_probing(struct tcp_sock *tp)
 
 	if (did_agree) {
 		/* return the suggested ratio later */
-		printk(KERN_INFO "ytxing: tp:%p OL_PROBE achievement agreed\n", tp);
+		printk(KERN_INFO "ytxing: tp:%p OL_PROBE agreement ACHIEVED\n", tp);
 		return run_2_res ? ol_p->intervals_data[2].red_ratio : ol_p->intervals_data[3].red_ratio;
 	} else {
 		/* no agreed result, return the same suggested ratio */
-		printk(KERN_INFO "ytxing: tp:%p OL_PROBE no achievement, probe again\n", tp);
+		printk(KERN_INFO "ytxing: tp:%p OL_PROBE agreement NOT achieved\n", tp);
 		return global->suggested_red_ratio;
 	}
 }
@@ -410,9 +410,10 @@ static u32 ol_suggest_ratio_moving(struct tcp_sock *tp)
 
 
 	grad = ol_calc_util_grad(global->suggested_red_ratio, utility, global->previous_suggested_red_ratio, previous_utility);
+	printk(KERN_INFO "ytxing: tp:%p utility:%lld previous_utility:%lld\n", tp, utility, previous_utility);
+	printk(KERN_INFO "ytxing: tp:%p global->suggested_red_ratio:%u global->previous_suggested_red_ratio:%u\n", tp, global->suggested_red_ratio >> 3, global->previous_suggested_red_ratio >> 3);
 	if (grad == 0){	
-		printk(KERN_INFO "ytxing: tp:%p OL_MOVE: grad %lld stay\n",
-		   tp, grad);
+		printk(KERN_INFO "ytxing: tp:%p OL_MOVE grad %lld stay\n", tp, grad);
 		return global->suggested_red_ratio;
 	}
 
@@ -430,8 +431,7 @@ static u32 ol_suggest_ratio_moving(struct tcp_sock *tp)
 	new_ratio = max_t(s64, global->suggested_red_ratio + step, OLSCHED_MIN_RED_RATIO);
 	new_ratio = min_t(s64, new_ratio, OLSCHED_MAX_RED_RATIO);
 
-	printk(KERN_INFO "ytxing: tp:%p OL_MOVE: grad %lld step %lld\n",
-		   tp, grad, step);
+	printk(KERN_INFO "ytxing: tp:%p OL_MOVE grad %lld step %lld\n", tp, grad / 8, step / 8);
 
 	return new_ratio;
 }
@@ -464,7 +464,7 @@ bool ol_current_send_interval_ended(struct ol_interval *interval, struct tcp_soc
 	interval->snd_timeout = timeout;
 	interval->snd_ended = true;
 	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END packets_sent:%u timeout:%d\n", tp, interval->index, packets_sent, timeout);
-	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END duration:%llu srtt_us:%u\n", tp, interval->index, tp->tcp_mstamp - interval->snd_time_begin, srtt_us);
+	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END duration:%llu srtt_us:%u\n", tp, interval->index, interval->snd_time_end - interval->snd_time_begin, srtt_us);
 	return true;
 }
 
@@ -534,7 +534,9 @@ static void start_current_send_interval(struct tcp_sock *tp)
 	interval->snd_time_begin = tp->tcp_mstamp;
 	interval->snd_seq_begin = tp->snd_nxt;
 	interval->pkts_out_begin = tp->data_segs_out; /* maybe? */
-	interval->known_seq = tp->snd_una; /* init known_seq as the next unacked seq, should be less than snd_next*/
+	interval->known_seq = interval->snd_seq_begin; /* init known_seq as the next unacked seq, should be less than snd_next*/
+	interval->lost_bytes = 0;
+	interval->lost_begin = tp->lost;
 
 	interval->snd_ended = false;
 	interval->rcv_ended = false;
@@ -703,6 +705,7 @@ static void interval_process(struct ol_global *global, struct tcp_sock *tp)
 		|| (global->snd_idx == 1 && global->state == OL_START)) {						/* the only one interval stop sending in OL_START */
 
 		global->waiting = true;
+		global->red_ratio = global->suggested_red_ratio; /* use suggested ratio instead of tweaked ratio */
 		return;
 	}
 
@@ -751,10 +754,12 @@ static void update_interval_info_rcv(struct ol_global *global, struct tcp_sock *
 	
 	//for all active intervals (that sent pkts) check if cumulative acks changed the last known seq, or if the sacks did
 	for (i = 0; i < OLSCHED_INTERVALS_NUM; i++) {
-		if (i > global->snd_idx)
-			continue;
 		struct ol_interval *interval = &ol_p->intervals_data[i];
 		u32 current_interval_known_seq = interval->known_seq;
+
+		/* inactive intervals need no update */
+		if (i > global->snd_idx)
+			continue;
 
 		//set the last known sequence to the last cumulative ack if it is better than the last known seq
 		if (after(tp->snd_una, interval->known_seq)) {
@@ -773,7 +778,7 @@ static void update_interval_info_rcv(struct ol_global *global, struct tcp_sock *
 				//mark the hole as lost bytes in this monitor interval
 				if (sack_cache[j].start_seq != 0 && sack_cache[j].end_seq != 0) {
 					if (before(interval->known_seq, sack_cache[j].start_seq)) {
-						s32 lost = min(sack_cache[j].start_seq - interval->known_seq, interval->snd_seq_end - interval->known_seq);
+						u32 lost = min(sack_cache[j].start_seq - interval->known_seq, interval->snd_seq_end - interval->known_seq);
 						interval->lost_bytes += lost;
 					}
 					//update the last known seq if it was changed
@@ -784,7 +789,7 @@ static void update_interval_info_rcv(struct ol_global *global, struct tcp_sock *
 			}
 		}
 		/* ytxing: if this interval just start receiving pkts for the first time */
-        if (before(current_interval_known_seq, interval->snd_seq_begin) && !before(interval->known_seq, interval->snd_seq_begin)) {
+        if (current_interval_known_seq == interval->snd_seq_begin && after(interval->known_seq, interval->snd_seq_begin)) {
 		// if (interval->rcv_time_begin == 0) {
             interval->rcv_time_begin = tp->tcp_mstamp;
         }
@@ -794,6 +799,7 @@ static void update_interval_info_rcv(struct ol_global *global, struct tcp_sock *
             interval->rcv_time_end = tp->tcp_mstamp;
 			interval->rcv_ended = true;
 			printk(KERN_DEBUG "ytxing: tp:%p idx:%u RCV END sent:%u lost:%u known:%u\n", tp, interval->index, interval->snd_seq_end - interval->snd_seq_begin, interval->lost_bytes, interval->known_seq);
+			printk(KERN_DEBUG "ytxing: tp:%p idx:%u RCV END duration:%llu bandwidth:%llu\n", tp, interval->index, interval->rcv_time_end - interval->rcv_time_begin, olsched_get_bandwidth_interval(interval));
 			// interval->delivered_end = tp->delivered; /* sure? delivered is not reliable with sack since it might contain some pkts of other intervals*/
         }
 
@@ -810,12 +816,15 @@ static void olsched_check_quota(struct tcp_sock *tp,
 					  struct olsched_priv *ol_p, bool force)
 {
 	struct ol_global *global = ol_p->global_data;
+	// struct ol_interval *curr_interval = NULL;
+	// if (global->snd_idx < OLSCHED_INTERVALS_NUM)
+	// 	curr_interval = ol_p->intervals_data[global->snd_idx];
 	// still has quota, no need to calculate again
 	if (!force && (global->red_quota > 0 || global->new_quota > 0))
 		return;
 	global->red_quota =  (tp->snd_cwnd * global->red_ratio) >> OLSCHED_SCALE;
 	global->new_quota = tp->snd_cwnd - global->red_quota;
-	// printk(KERN_INFO "ytxing: tp %p red_quota %u new_quota %u ratio %u/1024\n", tp, global->red_quota, global->new_quota, global->red_ratio >> 3);
+	printk(KERN_INFO "ytxing: tp:%p use idx:%d red_quota:%u new_quota:%u ratio:%u/1024\n", tp, global->snd_idx, global->red_quota, global->new_quota, global->red_ratio >> 3);
 }
 
 /* ytxing:
@@ -1467,7 +1476,7 @@ static void olsched_init(struct sock *sk)
 	ol_p->intervals_data[0].invalid_utility = 0; // 1 means this utility is not trustworthy, 0 otherwise
 
 	ol_p->global_data->round = 0;
-	printk(KERN_DEBUG "ytxing: olsched_init tp:%p ol_p->global_data->init:%d\n", tcp_sk(sk), ol_p->global_data->init);
+	// printk(KERN_DEBUG "ytxing: olsched_init tp:%p ol_p->global_data->init:%d\n", tcp_sk(sk), ol_p->global_data->init);
 	ol_p->global_data->init = 1;
 
 	/* first try to move from 0 -> 1, for throughput TODO */
