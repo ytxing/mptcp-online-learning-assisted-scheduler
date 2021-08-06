@@ -30,10 +30,12 @@ typedef __s8 s8;
 typedef __s32 s32;
 typedef __s64 s64;
 
-#define OLSCHED_INTERVALS_NUM 4
-#define OLSCHED_INTERVALS_DURATION 3/2 /* OLSCHED_INTERVALS_DURATION * srtt_us */
-#define OLSCHED_INTERVALS_TIMEOUT 10 /* OLSCHED_INTERVALS_TIMEOUT * srtt_us */
-#define OLSCHED_INTERVAL_MIN_PACKETS 10
+#define OLSCHED_INTERVALS_NUM 1
+#define OLSCHED_INTERVALS_MIN_DURATION 100 * USEC_PER_MSEC /* minimal duration(us) */
+#define OLSCHED_INTERVALS_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 3
+#define OLSCHED_INTERVAL_MIN_PACKETS 30
+
+#define OLSCHED_ARMS_NUM 4
 
 #define OLSCHED_SCALE 13
 #define OLSCHED_UNIT (1 << OLSCHED_SCALE)
@@ -48,11 +50,15 @@ typedef __s64 s64;
 
 
 /* ytxing: for utility function calculation */
-#define OLSCHED_ALPHA 0.99 /* (0, 1) */
-#define OLSCHED_BETA 99 /* div by OLSCHED_UTIL_BASE */ 
-#define OLSCHED_GAMMA 99 /* div by OLSCHED_UTIL_BASE */ 
-#define OLSCHED_UTIL_BASE 100
+#define OLSCHED_GAMMA_MAB 99 /* div by OLSCHED_GAMMA_MAB_BASE */ 
+#define OLSCHED_GAMMA_MAB_BASE 100
 
+static const u16 ol_arm_to_red_ratio[OLSCHED_ARMS_NUM] = {
+	OLSCHED_UNIT * 1,
+	OLSCHED_UNIT * 2 / 3,
+	OLSCHED_UNIT * 1 / 3,
+	OLSCHED_MIN_RED_RATIO
+};
 
 /* Scale factor for rate in pkt/uSec unit to avoid truncation in bandwidth
  * estimation. The rate unit ~= (1500 bytes / 1 usec / 2^24) ~= 715 bps.
@@ -75,7 +81,7 @@ enum OL_MOVING_STATE {
  * in order to record the behaviour of this subflow and for utility 
  * function caculation.
  */
-struct ol_interval {
+struct ol_interval_MAB {
 
 	u8 index;
 	u16	red_ratio;
@@ -97,16 +103,18 @@ struct ol_interval {
 	u32 lost_end; 			/*pkts*/
 	u32 lost_bytes;
 
-	s64 utility;
-	s64 previous_utility;
+	u8 previous_arm_idx;
+	u8 current_arm_idx;
+	u16 arm_weight[OLSCHED_ARMS_NUM];
+	u16 arm_probability[OLSCHED_ARMS_NUM];
 
-	u8	snd_timeout:1,
-		snd_ended:1,
-		rcv_timeout:1,
+	u32	interval_duration;
+
+	u8	snd_ended:1,
 		rcv_ended:1,
 		invalid_utility:1,
 		init:1,
-		unusued:2;
+		unusued:4;
 };
 
 enum OL_GLOBAL_STATE {
@@ -115,12 +123,14 @@ enum OL_GLOBAL_STATE {
 	OL_START,  // stay at current ratio
 };
 
-struct ol_global {
+
+struct ol_global_MAB {
 	u16	red_quota;	// ytxing: how many redundant pkts should this subflow send
 	u16	new_quota;	// ytxing: how many new pkts should this subflow send
 	u16	red_ratio;	// ytxing: the ratio to calculate current quota, the same as the red_ratio current interval >> OLSCHED_SCALE
-	u16	suggested_red_ratio;	// ytxing: this ratio is suggested by decisions, and should be used to setup intervals (with some tweaks), may not be the same as red_ratio
-	u16	previous_suggested_red_ratio;	
+	
+
+	struct ol_interval_MAB *intervals_data; // ytxing: for meta_tp infomation
 
 	/* intervals info */
 	u8	snd_idx:4, 	// ytxing: the interval index currently sending pkts (< OLSCHED_INTERVALS_NUM)
@@ -130,14 +140,10 @@ struct ol_global {
 		moving:1,	// ytxing: ture if olsched move toward one direction, stop when utility decreases
 		first_move:1,
 		init:1,
-		unused:4;
-	
-	s64 (*util_func)(struct ol_interval *, struct sock *);	//ytxing: the interval to calculate the utility and the sk of the interval
+		unused:4; 
 
-	enum OL_GLOBAL_STATE state;
+	enum OL_GLOBAL_STATE state;	
 
-	/* for debug */
-	u32 round;
 };
 
 /* Struct to store the data of a single subflow */
@@ -150,16 +156,17 @@ struct olsched_priv {
 	u32 skb_end_seq;
 
 	/* Structure to store status for each subflow in each interval */
-	struct ol_interval *intervals_data;
+	struct ol_interval_MAB *intervals_data;
 
 	/* Some status for each subflow to follow currently */
-	struct ol_global *global_data;
+	struct ol_global_MAB *global_data;
 };
 
 /* Struct to store the data of the control block */
 struct olsched_cb {
 	/* The next subflow where a skb should be sent or NULL */
 	struct tcp_sock *next_subflow;
+	struct ol_interval_MAB *meta_interval;
 };
 
 /* Returns the socket data from a given subflow socket */
@@ -173,6 +180,23 @@ static struct olsched_cb *olsched_get_cb(struct tcp_sock *tp)
 {
 	return (struct olsched_cb *)&tp->mpcb->mptcp_sched[0];
 }
+
+/* get x = number * OLSCHED_UNIT, return (e^number)*OLSCHED_UNIT */
+static u32 ol_exp(u32 x)
+{
+	s64 temp = OLSCHED_UNIT;
+	s64 e = OLSCHED_UNIT;
+	int i;
+
+	for (i = 1; temp != 0; i++) {
+		temp *= x;
+		temp /= i;
+		temp /= OLSCHED_UNIT;
+		e += temp;
+	}
+	return e;
+}
+
 
 static int olsched_get_active_valid_sks_num(struct sock *meta_sk)
 {
@@ -223,12 +247,13 @@ static u64 olsched_get_bandwidth(struct sock *sk)
  *			2. bandwidth = delivered_byte / time_interval
  *			in Bps
  */
-static u64 olsched_get_bandwidth_interval(struct ol_interval *interval)
+static u64 olsched_get_bandwidth_interval(struct ol_interval_MAB *interval, struct tcp_sock *tp)
 {
 	u64 bandwidth;
-	u64 byte_rcv = interval->snd_seq_end - interval->snd_seq_begin - interval->lost_bytes;
+	u32 mss = tp->mss_cache;
+	u64 byte_rcv = (interval->delivered_end - interval->delivered_begin) * mss;
 	u64 duration = interval->rcv_time_end - interval->rcv_time_begin; 
-	if (duration <= 0 || byte_rcv < 0)
+	if (duration <= 0 || byte_rcv <= 0)
 		return 0;
 
 	bandwidth = byte_rcv * USEC_PER_SEC;
@@ -240,7 +265,7 @@ static u64 olsched_get_bandwidth_interval(struct ol_interval *interval)
  * get the loss rate of the sk, make sure this interval is COMPLETED		
  * in (0, 1) << OLSCHED_SCALE
  */
-static u64 olsched_get_loss_rate(struct ol_interval *interval)
+static u64 olsched_get_loss_rate(struct ol_interval_MAB *interval)
 {
 	u64 loss_rate;
 	u32 delivered;
@@ -251,62 +276,34 @@ static u64 olsched_get_loss_rate(struct ol_interval *interval)
 
 	loss_rate = (interval->lost_end - interval->lost_begin) << OLSCHED_SCALE;
 	delivered = interval->delivered_end - interval->delivered_begin;
-	if (delivered == 0)
-		return 0;
+
 	do_div(loss_rate, delivered);
 	return loss_rate;
 }
 
-static bool olsched_check_utility_invalid(struct tcp_sock *tp)
-{
+/* tweak the suggested ratio and setup four intervals */
+static void ol_setup_intervals_MAB(struct tcp_sock *tp)
+{	
 	struct olsched_priv *ol_p = olsched_get_priv(tp);
-	struct ol_global *global = ol_p->global_data;
-	bool invalid;
-
-	if(global->state == OL_MOVE || global->state == OL_START){
-		if (ol_p->intervals_data[0].invalid_utility)
-			printk(KERN_INFO "ytxing: tp:%p INVALID UTIL\n", tp);
-		return ol_p->intervals_data[0].invalid_utility;
-	}
+	struct olsched_cb *ol_cb = olsched_get_cb(tp);
+	struct ol_global_MAB *global = ol_p->global_data;
+	struct ol_interval_MAB *interval, *meta_interval = ol_cb->meta_interval[0];
 	
-	invalid = ol_p->intervals_data[0].invalid_utility || ol_p->intervals_data[1].invalid_utility || ol_p->intervals_data[2].invalid_utility || ol_p->intervals_data[3].invalid_utility;
-	if (invalid)
-		printk(KERN_INFO "ytxing: tp:%p INVALID UTIL\n", tp);
-	return invalid;
+	
+
+	global->snd_idx = 0;
+	global->rcv_idx = 0;
+	global->waiting = false;
+	global->state = OL_PROBE;
 }
 
-/* Calculate the graident of utility w.r.t. sending rate, but only if the rates
- * are far enough apart for the measurment to have low noise.
- * ( in OLSCHED_UNIT )
- */
-static s64 ol_calc_util_grad(s64 ratio_1, s64 util_1, s64 ratio_2, s64 util_2) {
-	s64 rate_diff_ratio = (OLSCHED_UNIT * (ratio_2 - ratio_1)) / ratio_1;
-	printk(KERN_INFO "ytxing: rate_diff_ratio %lld OLSCHED_UNIT * OLSCHED_GRAD_NOISE%d\n", rate_diff_ratio, OLSCHED_GRAD_NOISE);
-	if (abs(rate_diff_ratio) < OLSCHED_GRAD_NOISE){
-		printk(KERN_INFO "ytxing: UTIL GRAD too little difference\n");
-		return 0;
-	}
-	printk(KERN_INFO "ytxing: util_2%lld util_1%lld\n", util_2, util_1);
-	return (OLSCHED_UNIT * (util_2 - util_1)) / (ratio_2 - ratio_1); /* ratio << OLSCHED_SCALE */
-}
 
 /* tweak the suggested ratio and setup four intervals */
-static void ol_setup_intervals_probing(struct tcp_sock *tp)
+static void ol_setup_intervals_probing(struct tcp_sock *tp, int arm_idx)
 {	
 	struct olsched_priv *ol_p;
-	struct ol_global *global;
-	u16 red_ratio_hi, red_ratio_lo;
-	char rand;
-	int i;
+	struct ol_global_MAB *global;
 
-	ol_p = olsched_get_priv(tp);
-	global = ol_p->global_data;
-
-	get_random_bytes(&rand, 1);
-
-	/* change the global ratio for probing */
-	red_ratio_hi = min_t(s16, global->suggested_red_ratio + OLSCHED_PROBING_EPSILON, OLSCHED_MAX_RED_RATIO);
-	red_ratio_lo = max_t(s16, global->suggested_red_ratio - OLSCHED_PROBING_EPSILON, OLSCHED_MIN_RED_RATIO);
 
 	for (i = 0; i < OLSCHED_INTERVALS_NUM; i += 2) {
 		if ((rand >> (i / 2)) & 1) {
@@ -350,7 +347,7 @@ static void ol_setup_intervals_moving(struct tcp_sock *tp)
 static void ol_setup_intervals_starting(struct tcp_sock *tp)
 {
 	struct olsched_priv *ol_p;
-	struct ol_global *global;
+	struct ol_global_MAB *global;
 	ol_p = olsched_get_priv(tp);
 	global = ol_p->global_data;
 
@@ -439,45 +436,55 @@ static u32 ol_suggest_ratio_moving(struct tcp_sock *tp)
 /* Have we sent all the data we need to for this interval? Must have at least
  * the minimum number of packets and should have sent 1 RTT worth of data.
  */
-bool ol_current_send_interval_ended(struct ol_interval *interval, struct tcp_sock *tp)
+bool ol_current_send_interval_ended(struct ol_interval_MAB *interval, struct tcp_sock *tp)
 {
 	u32 packets_sent = tp->data_segs_out - interval->pkts_out_begin;
-	u32 srtt_us = tp->srtt_us >> 3;
-	bool timeout;
+	u32 interval_duration = interval->interval_duration;
+
 
 	/* not enough sending duration */
-	if (tp->tcp_mstamp - interval->snd_time_begin < srtt_us * OLSCHED_INTERVALS_DURATION) 
+	if (tp->tcp_mstamp - interval->snd_time_begin < interval_duration) 
 		return false;
 		
-	if (srtt_us)
-		timeout = (tp->tcp_mstamp - interval->snd_time_begin) > srtt_us * OLSCHED_INTERVALS_TIMEOUT;
-	else
-		timeout = false;
-	/* not enough packets out and not timeout */
-	if (packets_sent < OLSCHED_INTERVAL_MIN_PACKETS && !timeout)
-		return false;
+	// /* not enough packets out and not timeout */
+	// if (packets_sent < OLSCHED_INTERVAL_MIN_PACKETS && !timeout)
+	// 	return false;
 
 	/* end the sending state this interval */
 	interval->pkts_out_end = tp->data_segs_out; /* sure? maybe for non-sack */
 	interval->snd_seq_end = tp->snd_nxt;
 	interval->snd_time_end = tp->tcp_mstamp;
-	interval->snd_timeout = timeout;
 	interval->snd_ended = true;
-	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END packets_sent:%u timeout:%d\n", tp, interval->index, packets_sent, timeout);
-	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END duration:%llu srtt_us:%u\n", tp, interval->index, interval->snd_time_end - interval->snd_time_begin, srtt_us);
+	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END packets_sent:%u\n", tp, interval->index, packets_sent);
+	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END actual_duration:%llu interval_duration:%u\n", tp, interval->index, interval->snd_time_end - interval->snd_time_begin, interval_duration);
 	return true;
 }
+
+/* all send intervals (of all subflows) ended? */
+bool ol_all_subflow_send_interval_ended(struct tcp_sock *meta_tp)
+{
+	struct mptcp_tcp_sock *mptcp;
+	// struct ol_global *global = olsched_get_cb(meta_tp);
+	struct mptcp_cb *mpcb = meta_tp->mpcb;
+	bool all_ended = true;
+
+	mptcp_for_each_sub(mpcb, mptcp) {
+		struct sock *sk = mptcp_to_sock(mptcp);		
+		struct tcp_sock *tp = mptcp->tp;
+		struct olsched_priv *ol_p = olsched_get_priv(tp);
+
+		all_ended = all_ended && ol_current_send_interval_ended(ol_p->intervals_data[0], tp);
+	}
+
+	return all_ended;
+}
+
 
 /* Have we accounted for (acked or lost) enough of the packets that we sent to
  * calculate summary statistics?
  */
-bool receive_interval_ended(struct ol_interval *interval, struct tcp_sock *tp)
+bool receive_interval_ended(struct ol_interval_MAB *interval)
 {
-	u32 srtt_us = tp->srtt_us >> 3;
-	bool timeout;
-	if (!srtt_us)
-		return false;
-
 	if(interval->rcv_ended)
 		return true;
 
@@ -485,51 +492,43 @@ bool receive_interval_ended(struct ol_interval *interval, struct tcp_sock *tp)
 		interval->rcv_ended = true;
 		return true;
 	}
-	// timeout = (tp->tcp_mstamp - interval->rcv_time_begin) > srtt_us * OLSCHED_INTERVALS_TIMEOUT;
-	timeout = false; // not sure rcv interval needs timeout
-	
-	// printk(KERN_DEBUG "ytxing: BUG tp:%p receive_interval_ended tp->tcp_mstamp%llu - interval->rcv_time_begin%llu\n", tp, tp->tcp_mstamp, interval->rcv_time_begin);
-	if(timeout){
-		interval->rcv_timeout = timeout;
-		interval->rcv_time_end = tp->tcp_mstamp;
-		interval->rcv_ended = true;
-		if(interval->snd_ended == false)
-			printk(KERN_DEBUG "ytxing: BUG tp:%p interval:%d rcv_timeout before snd_ended\n", tp, interval->index);
-		return true;
-	}
 
 	return false;
 }
 
-bool all_receive_interval_ended(struct ol_global *global, struct tcp_sock *tp)
+
+/* for MAB Solution, check if all intervals in each tp is ended */
+bool all_receive_interval_ended(struct sock *meta_sk)
 {
-	int i;
-	struct olsched_priv *ol_p = olsched_get_priv(tp);
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk);	
+	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct ol_interval_MAB *meta_interval = ol_cb->meta_interval[0];
+	struct mptcp_tcp_sock *mptcp;
+	// struct ol_global *global = olsched_get_cb(meta_tp);
+	struct mptcp_cb *mpcb = meta_tp->mpcb;
+	bool all_ended = true;
 
-	/* OL_MOVE only use one interval */
-	if(global->state == OL_MOVE || global->state == OL_START)
-		return receive_interval_ended(&ol_p->intervals_data[0], tp);
+	mptcp_for_each_sub(mpcb, mptcp) {
+		struct sock *sk = mptcp_to_sock(mptcp);		
+		struct tcp_sock *tp = mptcp->tp;
+		struct olsched_priv *ol_p = olsched_get_priv(tp);
 
-	/* if not all intervals stop sending, then return false */
-	if(global->snd_idx < OLSCHED_INTERVALS_NUM - 1)
-		return false;
+		/* TODO valid check, continue */
 
-	for(i = 0; i < OLSCHED_INTERVALS_NUM; i++){
-		if(!receive_interval_ended(&ol_p->intervals_data[i], tp)){
-			return false;
-		}
+		all_ended = all_ended && receive_interval_ended(&ol_p->intervals_data[0]);
 	}
-	return true;
+
+	return all_ended && receive_interval_ended(meta_interval);;
 }
 
 /* Set the red_ratio based on the currently-sending interval
  * and update some interval states.
  */
-static void start_current_send_interval(struct tcp_sock *tp)
+void start_current_send_interval(struct tcp_sock *tp)
 {
 	struct olsched_priv *ol_p = olsched_get_priv(tp);
-	struct ol_global *global = ol_p->global_data;
-	struct ol_interval *interval = &ol_p->intervals_data[global->snd_idx];
+	struct ol_global_MAB *global = ol_p->global_data;
+	struct ol_interval_MAB *interval = &ol_p->intervals_data[0];
 
 	interval->snd_time_begin = tp->tcp_mstamp;
 	interval->snd_seq_begin = tp->snd_nxt;
@@ -540,179 +539,109 @@ static void start_current_send_interval(struct tcp_sock *tp)
 
 	interval->snd_ended = false;
 	interval->rcv_ended = false;
-	interval->snd_timeout = false;
-	interval->rcv_timeout = false;
 	/* when a interval is active, the global ratio is set to the interval's ratio */
 	global->red_ratio = interval->red_ratio; 
 
 	printk(KERN_DEBUG "ytxing: tp:%p start interval snd_idx: %u ratio: %u/1024\n", tp, interval->index, global->red_ratio >> 3);
 }
 
-
-/* decide this round of probing: 
- * 1. update to a new ratio and move in a certain direction
- * 2. or keep on probing
- */
-static void ol_probing_decide(struct sock *meta_sk, struct sock *sk)
+void ol_update_arm_probality(struct sock *sk)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
+	struct tcp_sock *tp = tcp_sock(sk);
 	struct olsched_priv *ol_p = olsched_get_priv(tp);
-	struct ol_interval *interval;
-	struct ol_global *global = ol_p->global_data;
-	u32 new_ratio;
-	bool invalid_utility;
+	struct ol_interval_MAB *interval = ol_p->intervals_data[0];
+	// struct ol_global_MAB *global = ol_p->global_data;
 
+	u32 arm_weight_sum = 0, gamma_over_K = (OLSCHED_UNIT * OLSCHED_GAMMA_MAB) / (OLSCHED_ARMS_NUM * OLSCHED_GAMMA_MAB_BASE);
+	u64 temp;
 	int i;
 
-	for (i = 0; i < OLSCHED_INTERVALS_NUM; i++){
-		interval = &ol_p->intervals_data[i];
-		(*ol_p->global_data->util_func)(interval, sk); /* utility is now in interval->utility */
-	}
-	invalid_utility = olsched_check_utility_invalid(tp);
-
-	new_ratio = ol_suggest_ratio_probing(tp); /* the ratio with highest utility in four intervals */
-
-	printk(KERN_INFO "ytxing: tp:%p red_ratio %u (from %u)\n", tp, new_ratio >> 3, global->suggested_red_ratio >> 3);
-
-	global->previous_suggested_red_ratio = global->suggested_red_ratio;
-	if (new_ratio != global->suggested_red_ratio && !invalid_utility) {
-		/* move in this direction (agreement achieved) */
-		global->suggested_red_ratio = new_ratio;
-		global->moving = true;
-		global->first_move = true;
-		global->state = OL_MOVE;
-		printk(KERN_INFO "ytxing: tp:%p STATE CHANGE OL_PROBE -> OL_MOVE\n", tp);
-	    ol_setup_intervals_moving(tp);
-	} else {
-		/* or keep on probing (no agreement achieved) */
-		global->moving = false;
-		global->state = OL_PROBE;
-		printk(KERN_INFO "ytxing: tp:%p STATE CHANGE OL_PROBE -> OL_PROBE\n", tp);
-	    ol_setup_intervals_probing(tp);
+	for (i = 0; i < OLSCHED_ARMS_NUM; i++){
+		arm_weight_sum += interval->arm_weight[i];
 	}
 
-	start_current_send_interval(tp);
+	for (i = 0; i < OLSCHED_ARMS_NUM; i++){
+		temp = (interval->arm_weight[i] * OLSCHED_UNIT) / arm_weight_sum;
+		temp *= OLSCHED_GAMMA_MAB_BASE - OLSCHED_GAMMA_MAB;
+		temp /= OLSCHED_GAMMA_MAB_BASE;
+		interval->arm_probability[i] = temp + gamma_over_K;
+	}
+
 }
 
-/* Choose new direction and update state from the moving state.*/
-static void ol_moving_decide(struct sock *meta_sk, struct sock *sk)
+u8 pull_the_arm_accordingly(struct sock *sk)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
+	struct tcp_sock *tp = tcp_sock(sk);
 	struct olsched_priv *ol_p = olsched_get_priv(tp);
-	// struct ol_interval *interval;
-	struct ol_global *global = ol_p->global_data;
-	u16 new_ratio = ol_suggest_ratio_moving(tp);
-	enum OL_MOVING_STATE previous_direction, curr_direction;
-	bool invalid_utility, go_to_probe = false;
-	invalid_utility = olsched_check_utility_invalid(tp);
+	struct ol_interval_MAB *interval = ol_p->intervals_data[0];
+	// struct ol_global_MAB *global = ol_p->global_data;
+	int arm_idx;
+	u16 random, probability_cumulated = 0;
+	get_random_bytes(&random, OLSCHED_SCALE - 1);
+	if (random > OLSCHED_UNIT)
+		printk(KERN_DEBUG "ytxing: tp:%p BUG random > OLSCHED_UNIT\n", tp, interval->index, global->red_ratio >> 3);
 
-	if (global->previous_suggested_red_ratio < global->suggested_red_ratio)
-		previous_direction = OL_RATIO_UP;
-	else if (global->previous_suggested_red_ratio == global->suggested_red_ratio)
-		previous_direction = OL_RATIO_EQUAL;
-	else if (global->previous_suggested_red_ratio > global->suggested_red_ratio)
-		previous_direction = OL_RATIO_DOWN;
-
-	if (global->suggested_red_ratio < new_ratio)
-		curr_direction = OL_RATIO_UP;
-	else if (global->suggested_red_ratio == new_ratio)
-		curr_direction = OL_RATIO_EQUAL;
-	else if (global->suggested_red_ratio > new_ratio)
-		curr_direction = OL_RATIO_DOWN;
-
-	if (previous_direction == OL_RATIO_EQUAL && curr_direction == OL_RATIO_EQUAL)
-		go_to_probe = true;
-
-	printk(KERN_INFO "ytxing: tp:%p red_ratio %u->%u->%u (/1024) first_move:%d\n", tp, global->previous_suggested_red_ratio >> 3, global->suggested_red_ratio >> 3, new_ratio >> 3, global->first_move);
-	global->previous_suggested_red_ratio = global->suggested_red_ratio;
-	global->suggested_red_ratio = new_ratio;
-	if (!global->first_move && (previous_direction != curr_direction || invalid_utility || go_to_probe)) {
-		global->moving = false;
-		global->first_move = false;
-		global->state = OL_PROBE;
-		printk(KERN_INFO "ytxing: tp:%p STATE CHANGE OL_MOVE -> OL_PROBE\n", tp);
-		ol_setup_intervals_probing(tp);
-
-	} else {
-		global->moving = true;
-		global->first_move = false;
-		global->state = OL_MOVE;
-		printk(KERN_INFO "ytxing: tp:%p STATE CHANGE OL_MOVE -> OL_MOVE\n", tp);
-		ol_setup_intervals_moving(tp);
+	for (arm_idx = 0; arm_idx < OLSCHED_ARMS_NUM; arm_idx++){
+		probability_cumulated += interval->arm_probability[arm_idx];
+		if (random <= probability_cumulated){
+			break;
+		}
 	}
 
-	start_current_send_interval(tp);
+	return arm_idx;
 }
 
-/* Choose new direction and update state from the moving state.*/
-static void ol_starting_decide(struct sock *meta_sk, struct sock *sk)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct olsched_priv *ol_p = olsched_get_priv(tp);
-	struct ol_interval *interval = &ol_p->intervals_data[0];
-	struct ol_global *global = ol_p->global_data;
-	s64 utility, previous_utility;
-	u16 new_ratio;
-	bool invalid_utility;
 
-	if (ol_p->global_data->state != OL_START){
-		printk(KERN_INFO "ytxing: BUG wrong state\n");
-		return;
-	}
-
-	/* try to use lower red_ratio for higher throughput at the beginning */
-	new_ratio = max_t(s16, global->suggested_red_ratio - OLSCHED_START_STEP, OLSCHED_MIN_RED_RATIO);
-
-	previous_utility = interval->utility;
-	(*global->util_func)(interval, sk);
-	utility = interval->utility;
-	
-	invalid_utility = olsched_check_utility_invalid(tp);
-
-	printk(KERN_INFO "ytxing: tp:%p previous_utility:%lld utility:%lld\n", tp, previous_utility, utility);
-	printk(KERN_INFO "ytxing: tp:%p new_ratio:%u old_ratio:%u\n", tp, new_ratio >> 3, global->suggested_red_ratio >> 3);
-	global->previous_suggested_red_ratio = global->suggested_red_ratio;
-	global->suggested_red_ratio = new_ratio;
-	if ((previous_utility > utility && !invalid_utility) || new_ratio == OLSCHED_MIN_RED_RATIO) {
-		/* end starting state, enter OL_PROBE */
-		global->moving = false;
-		global->state = OL_PROBE;
-		printk(KERN_INFO "ytxing: tp:%p STATE CHANGE OL_START -> OL_PROBE\n", tp);
-		ol_setup_intervals_probing(tp);
-
-	} else {
-		/* still in OL_START */
-		global->moving = false;
-		global->state = OL_START;
-		printk(KERN_INFO "ytxing: tp:%p STATE CHANGE OL_START -> OL_START\n", tp);
-		ol_setup_intervals_starting(tp);
-	}
-
-	start_current_send_interval(tp);
-}
-
-/* ytxing:
- * process to another interval in OL_PROBE.
+/* The Exp3 Algorithm: 
+ * 1. set arm probability according to arm weight
+ * 2. draw arm randomly according to the probabilities (curr_arm_idx)
+ * 3. receive reward of the previous pulled arm (ol_exp3_decide start from here)
+ * 4. for each arm, update their weights
+ *
+ *           1->2->3->4->1->2->3->4->1->2...
+ * initialization | in this function
  */
-static void interval_process(struct ol_global *global, struct tcp_sock *tp)
+static void ol_exp3_update(struct sock *meta_sk, struct sock *sk)
 {
-	global->snd_idx++;
-	// if (global->snd_idx == OLSCHED_INTERVALS_NUM || global->moving) {
-	// 	global->waiting = true;
-	// }
-	if ((global->snd_idx == OLSCHED_INTERVALS_NUM && global->state == OL_PROBE) 	/* all intervals stop sending in OL_PROBE */
-		|| (global->snd_idx == 1 && global->state == OL_MOVE) 						/* the only one interval stop sending in OL_MOVE */
-		|| (global->snd_idx == 1 && global->state == OL_START)) {						/* the only one interval stop sending in OL_START */
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
+	struct tcp_sock *tp = tcp_sock(sk);
+	struct olsched_priv *ol_p = olsched_get_priv(tp);
+	struct mptcp_cb *mpcb = meta_tp->mpcb;
+	struct ol_interval_MAB *interval = ol_p->intervals_data[0];
+	struct ol_global_MAB *global = ol_p->global_data;
+	u32 reward, new_ratio;
+	int i, j;
 
-		global->waiting = true;
-		global->red_ratio = global->suggested_red_ratio; /* use suggested ratio instead of tweaked ratio */
-		return;
-	}
+	/* update arm weight and probability */
+	interval->previous_arm_idx = interval->current_arm_idx;
 
+	/* receive reward from the network */
+	reward = ol_calc_reward(interval, sk); // reward << OLSCHED_SCALE, actually. Since 0 < reward <= 1. 
+	reward *= OLSCHED_UNIT; /* arm_probability is in OLSCHED_UNIT, so expand the dividend */
+	do_div(reward, interval->arm_probability[interval->previous_arm_idx]);
+	// interval->arm_weight[interval->previous_arm_idx] update;
+	reward *= OLSCHED_UNIT * OLSCHED_GAMMA_MAB;
+	do_div(reward, OLSCHED_ARMS_NUM * OLSCHED_GAMMA_MAB_BASE);
+
+	interval->arm_weight[interval->previous_arm_idx] *= ol_exp(reward); /* reward << OLSCHED_SCALE, actually */
+	/* Since arm_weight is stored in OLSCHED_UNIT, *= will multiply it to OLSCHED_UNIT^2 */
+	interval->arm_weight[interval->previous_arm_idx] >>= OLSCHED_SCALE;
+
+	/* update the probility of previous arm accordingly */
+	ol_update_arm_probality(sk);
+
+	/* maybe don't pull the arm immediately, 
+	 * since only one tp is allowed to change its behavior at the same time.
+	 * TODO
+	 */
+	interval->current_arm_idx = pull_the_arm_accordingly(sk);
+	
 	start_current_send_interval(tp);
 }
 
-static void update_interval_info_snd(struct ol_interval *interval, struct tcp_sock *tp)
+
+
+static void update_interval_info_snd(struct ol_interval_MAB *interval, struct tcp_sock *tp)
 {
 	interval->snd_seq_end = tp->snd_nxt;
 
@@ -722,90 +651,51 @@ static void update_interval_info_snd(struct ol_interval *interval, struct tcp_so
 	// printk(KERN_DEBUG "ytxing: tp:%p idx: %u snd_seq: %u->%u(%u)\n", tp, interval->index, interval->snd_seq_begin, interval->snd_seq_end, interval->snd_seq_end - interval->snd_seq_begin);
 }
 
-/* ytxing:
- * update_interval_info_rcv collect infomation from sack blocks
- * in order to track the pkts sent in a certain interval.
- * When the interval sees a seq (known_seq) larger than the snd_seq_end, and the sending has stopped,
- * mark the time stamp.
- */
-static void update_interval_info_rcv(struct ol_global *global, struct tcp_sock *tp)
+static void update_all_subflow_interval_info_snd(struct tcp_sock *meta_tp)
 {
-	struct olsched_priv *ol_p = olsched_get_priv(tp);
-	int i,j;
-	struct tcp_sack_block sack_cache[4];
+	struct mptcp_tcp_sock *mptcp;
+	struct mptcp_cb *mpcb = meta_tp->mpcb;
 
-	//sort received sacks according to sequence in increasing order
-	if (tcp_is_sack(tp) && tp->sacked_out) {
-		memcpy(sack_cache, tp->recv_sack_cache, sizeof(sack_cache));
-		for (i = 0; i < 4; i++) {
-			for (j = i+1; j < 4; j++) {
-				if (after(sack_cache[i].start_seq, sack_cache[j].start_seq)) {
-					u32 tmp = sack_cache[i].start_seq;
-					sack_cache[i].start_seq = sack_cache[j].start_seq;
-					sack_cache[j].start_seq = tmp;
+	mptcp_for_each_sub(mpcb, mptcp) {
+		struct sock *sk = mptcp_to_sock(mptcp);		
+		struct tcp_sock *tp = mptcp->tp;
+		struct olsched_priv *ol_p = olsched_get_priv(tp);
 
-					tmp = sack_cache[i].end_seq;
-					sack_cache[i].end_seq = sack_cache[j].end_seq;
-					sack_cache[j].end_seq = tmp;
-				}
-			}
-		}
-	}
-	
-	//for all active intervals (that sent pkts) check if cumulative acks changed the last known seq, or if the sacks did
-	for (i = 0; i < OLSCHED_INTERVALS_NUM; i++) {
-		struct ol_interval *interval = &ol_p->intervals_data[i];
-		u32 current_interval_known_seq = interval->known_seq;
-
-		/* inactive intervals need no update */
-		if (i > global->snd_idx)
-			continue;
-
-		//set the last known sequence to the last cumulative ack if it is better than the last known seq
-		if (after(tp->snd_una, interval->known_seq)) {
-			interval->known_seq = tp->snd_una;
-		}
-
-		//there are sacks
-		if (tcp_is_sack(tp) && tp->sacked_out) {
-			for (j = 0; j < 4; j++) { // tcp.h: struct tcp_sack_block recv_sack_cache[4];
-				//if the sack doesn't bring any new information, check the next one
-				/* ytxing: then interval->rcv_ended should be true */
-				if (!before(interval->known_seq, interval->snd_seq_end)) {
-					continue;
-				}
-
-				//mark the hole as lost bytes in this monitor interval
-				if (sack_cache[j].start_seq != 0 && sack_cache[j].end_seq != 0) {
-					if (before(interval->known_seq, sack_cache[j].start_seq)) {
-						u32 lost = min(sack_cache[j].start_seq - interval->known_seq, interval->snd_seq_end - interval->known_seq);
-						interval->lost_bytes += lost;
-					}
-					//update the last known seq if it was changed
-					if (after(sack_cache[j].end_seq, interval->known_seq)) {
-						interval->known_seq = sack_cache[j].end_seq;
-					}
-				}
-			}
-		}
-		/* ytxing: if this interval just start receiving pkts for the first time */
-        if (current_interval_known_seq == interval->snd_seq_begin && after(interval->known_seq, interval->snd_seq_begin)) {
-		// if (interval->rcv_time_begin == 0) {
-            interval->rcv_time_begin = tp->tcp_mstamp;
-        }
-		
-		/* ytxing: if the interval has seen all sent packets and finished sending */
-        if (interval->snd_ended && before(current_interval_known_seq, interval->snd_seq_end) && !before(interval->known_seq, interval->snd_seq_end)) {
-            interval->rcv_time_end = tp->tcp_mstamp;
-			interval->rcv_ended = true;
-			printk(KERN_DEBUG "ytxing: tp:%p idx:%u RCV END sent:%u lost:%u known:%u\n", tp, interval->index, interval->snd_seq_end - interval->snd_seq_begin, interval->lost_bytes, interval->known_seq);
-			printk(KERN_DEBUG "ytxing: tp:%p idx:%u RCV END duration:%llu bandwidth:%llu\n", tp, interval->index, interval->rcv_time_end - interval->rcv_time_begin, olsched_get_bandwidth_interval(interval));
-			// interval->delivered_end = tp->delivered; /* sure? delivered is not reliable with sack since it might contain some pkts of other intervals*/
-        }
-
+		update_interval_info_snd(ol_p->intervals_data[0], tp);
 	}
 
 }
+
+/* ytxing:
+ * simply update the known_seq of the interval
+ * 
+ */
+static void update_interval_info_rcv(struct ol_interval_MAB *interval, struct tcp_sock *tp)
+{
+	struct olsched_priv *ol_p = olsched_get_priv(tp);
+	
+	u32 current_interval_known_seq = interval->known_seq;
+	interval->known_seq = tp->snd_una;
+	
+	/* ytxing: if this interval just start receiving pkts for the first time */
+	if (!after(current_interval_known_seq, interval->snd_seq_begin) && after(interval->known_seq, interval->snd_seq_begin)) {
+		interval->delivered_begin = tp->delivered;
+		interval->lost_begin = tp->lost;
+		interval->rcv_time_begin = tp->tcp_mstamp;
+	}
+	/* ytxing: if the interval has seen all sent packets and finished sending */
+	if (interval->snd_ended && before(current_interval_known_seq, interval->snd_seq_end) && !before(interval->known_seq, interval->snd_seq_end)) {
+		interval->delivered_end = tp->delivered;
+		interval->lost_end = tp->lost;
+		interval->rcv_time_end = tp->tcp_mstamp;
+		interval->rcv_ended = true;
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u lost:%u known:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_end, interval->lost_end - interval->lost_begin, interval->known_seq);
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->rcv_time_begin, olsched_get_bandwidth_interval(interval));
+		// interval->delivered_end = tp->delivered; /* sure? delivered is not reliable with sack since it might contain some pkts of other intervals*/
+	}
+
+}
+
 
 /* ytxing:	
  * Calculate the redundant quota of this subflow,
@@ -815,7 +705,7 @@ static void update_interval_info_rcv(struct ol_global *global, struct tcp_sock *
 static void olsched_check_quota(struct tcp_sock *tp,
 					  struct olsched_priv *ol_p, bool force)
 {
-	struct ol_global *global = ol_p->global_data;
+	struct ol_global_MAB *global = ol_p->global_data;
 	// struct ol_interval *curr_interval = NULL;
 	// if (global->snd_idx < OLSCHED_INTERVALS_NUM)
 	// 	curr_interval = ol_p->intervals_data[global->snd_idx];
@@ -828,37 +718,30 @@ static void olsched_check_quota(struct tcp_sock *tp,
 }
 
 /* ytxing:
- * calculate the utility of curr_sk
- * This function is only called once when one Scheduling Interval(SI) finishes.
- * When calling this function, there should be valid bandwidth 
- * and rtt sample for all subflows .
+ * calculate the reward of current interval.
+ * When this is called, all tps finish receiving data and get its throughput estimation.
+ * reward_j(t) = throughput_meta / sum(throughput_subflow)
+ * Then 
  */
-#define FIXEDPT_BITS 64
-#define FIXEDPT_WBITS 40
-#define OMIT_STDINT
-#include "fixedptc.h"
-static s64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_sk) {
+static u64 ol_calc_reward(struct ol_interval_MAB *curr_interval, struct sock *curr_sk) {
 	struct sock *meta_sk = mptcp_meta_sk(curr_sk);
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk), *curr_tp = tcp_sk(curr_sk);	
 	struct mptcp_tcp_sock *mptcp;
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
-	// struct olsched_priv *curr_ol_p = olsched_get_priv(curr_tp);
+	struct olsched_priv *curr_ol_p = olsched_get_priv(curr_tp);
+	struct ol_interval_MAB *meta_interval = curr_ol_p->global_data->intervals_data[0];
+	struct ol_interval_MAB *interval;
 	// struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
 
-	u64 others_bw = 0, curr_bw, dRTT /* ((curr_rtt - minRTT) << OLSCHED_SCALE / minRTT) */;
-	u32 ratio_t, minRTT = 0xFFFFFFFF;
-
-	u64 bw_item, bw_item_f, ofo_item, loss_rate, loss_item;
-	s64 utility;
-	u32 sent_bytes;
-	u64 lost_bytes;
+	u64 subflow_throughput_sum = 0, meta_throughput;
+	u64 reward;
 
 
-	printk(KERN_DEBUG "ytxing: tp:%p idx:%u UTIL CAL\n", curr_tp, curr_interval->index);
+	meta_throughput = olsched_get_bandwidth_interval(meta_interval);
+
 
 	/* ytxing:	in this loop, we 
-	 *			1. calculate the ratio*bandwidth of other subflows 
-	 *			2. find a minimal RTT
+	 *			1. calculate the throughput of all subflows 
 	 */
 	mptcp_for_each_sub(mpcb, mptcp) {
 		struct sock *sk = mptcp_to_sock(mptcp);		
@@ -869,71 +752,15 @@ static s64 ol_calc_utility(struct ol_interval *curr_interval, struct sock *curr_
 		if (!subflow_is_active(tp) || mptcp_is_def_unavailable(sk)) /* we ignore unavailable subflows*/
 			continue;
 
-		if (tp->srtt_us < minRTT){
-			minRTT = tp->srtt_us;
-		}
-
-		if (curr_sk == sk)
-			continue;
-
 		ol_p = olsched_get_priv(tp);
-		ratio_t = ol_p->global_data->suggested_red_ratio; /* use global ratio for others */
-		bw_t = olsched_get_bandwidth(sk); /* use global ratio for others */
-		others_bw += (OLSCHED_UNIT - ratio_t) * bw_t; /* ytxing: (1 - ratio_t), be careful */
-		// printk(KERN_DEBUG "ytxing: tp:%p another (OLSCHED_UNIT - ratio_t) * bw_t:%llu\n", curr_tp, (OLSCHED_UNIT - ratio_t) * bw_t);
+		interval = ol_p->intervals_data[0];
+		subflow_throughput_sum += olsched_get_bandwidth_interval(interval);
 	}
-
-	/* bandwidth item */
-	// curr_bw = olsched_get_bandwidth(curr_sk);
-	curr_bw = olsched_get_bandwidth_interval(curr_interval);
-	// printk(KERN_DEBUG "ytxing: tp:%p idx:%u curr_bw:%llu\n", curr_tp, curr_interval->index, curr_bw);
-	bw_item = others_bw + curr_bw * (OLSCHED_UNIT - curr_interval->red_ratio); /* use interval ratio for current tp */
-	printk(KERN_DEBUG "ytxing: tp:%p idx:%u bw_item:%llu curr_red_ratio:%u\n", curr_tp, curr_interval->index, bw_item, curr_interval->red_ratio >> 3);
-
-	bw_item_f = fixedpt_fromint(bw_item);
-	bw_item_f = fixedpt_pow(bw_item_f, fixedpt_rconst(0.99));
-	bw_item = (bw_item_f >> FIXEDPT_FBITS); /* OLSCHED_ALPHA power TODO (does it work?*/;
-	// printk(KERN_DEBUG "ytxing: tp:%p bw_item^0.99: %llu\n", curr_tp, bw_item);
-
-	/* dRTT(ofo) item */
-	if(curr_tp->srtt_us == minRTT) {
-		dRTT = 0;
-	}
-	else {
-		dRTT = (curr_tp->srtt_us - minRTT) << OLSCHED_SCALE;
-		if (minRTT == 0){
-			printk(KERN_DEBUG "ytxing: tp:%p UTILI:0 div_u64: dRTT %llu/minRTT %u\n", curr_tp, dRTT, minRTT);
-			curr_interval->utility = 0;
-			curr_interval->invalid_utility = 1;
-			return 0;
-		}
-		dRTT = div_u64(dRTT, minRTT);
-	}
-	
-	printk(KERN_DEBUG "ytxing: tp:%p idx:%u dRTT:%llu/1024\n", curr_tp, curr_interval->index, dRTT >> 3);
-	ofo_item = (bw_item * dRTT) >> OLSCHED_SCALE;
-
-	/* loss item */
-	sent_bytes = curr_interval->snd_seq_end - curr_interval->snd_seq_begin;
-	if (sent_bytes == 0){
-		printk(KERN_DEBUG "ytxing: tp:%p UTILI:0 div_u64: sent_bytes == 0\n", curr_tp);
-		curr_interval->utility = 0;
-		curr_interval->invalid_utility = 1;
+	if (subflow_throughput_sum == 0)
 		return 0;
-	}
-	lost_bytes = curr_interval->lost_bytes;
-	loss_rate = div_u64(lost_bytes << OLSCHED_SCALE, sent_bytes);
-	printk(KERN_DEBUG "ytxing: tp:%p idx:%u loss_rate:%llu/1024\n", curr_tp, curr_interval->index, loss_rate >> 3);
-	loss_item = (bw_item * loss_rate) >> OLSCHED_SCALE; /* x loss_rate TODO*/
-
-	/* finally, the utility function */
-	utility = bw_item - (OLSCHED_BETA * ofo_item + OLSCHED_GAMMA * loss_item) / OLSCHED_UTIL_BASE;
-	
-
-	printk(KERN_DEBUG "ytxing: tp:%p idx:%u utility:%lld = bw_item:%llu - (%d/100)*ofo_item:%llu - (%d/100)*loss_item:%llu\n", curr_tp, curr_interval->index, utility, bw_item, OLSCHED_BETA, ofo_item, OLSCHED_GAMMA, loss_item);
-	curr_interval->utility = utility;
-	curr_interval->invalid_utility = 0;
-	return utility;
+	reward = meta_throughput * OLSCHED_UNIT;
+	do_div(reward, subflow_throughput_sum);
+	return reward;
 }
 
 
@@ -943,54 +770,56 @@ bool ol_valid(struct olsched_priv *ol_p)
 	return (ol_p && ol_p->global_data && ol_p->intervals_data && ol_p->global_data->init == 1 && ol_p->intervals_data[0].init == 1);
 }
 
-/* Updates the OL model */
+/* Updates the OL model of one sk */
 static void ol_process(struct sock *meta_sk, struct sock *sk)
 {
 
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	// struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
 
+	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct ol_interval_MAB *meta_interval = ol_cb->meta_interval[0];
 	struct olsched_priv *ol_p = olsched_get_priv(tp);
-	struct ol_global *global = ol_p->global_data;
-	struct ol_interval *interval;
+	struct ol_global_MAB *global = ol_p->global_data;
+	struct ol_interval_MAB *interval = &ol_p->intervals_data[0]; // ytxing: snd_idx should always be 0 with MAB
 
 	/* maybe some checking? */
 	if (!ol_valid(ol_p))
 		return;
 
-	if (global->snd_idx >= OLSCHED_INTERVALS_NUM && global->waiting == false){
-		printk(KERN_DEBUG "ytxing: tp:%p BUG global->snd_idx:%d\n", tp, global->snd_idx);
-		return;
-	}
+	/* TODO: maybe return when other tps are processing? */
+
 	/* handle interval in sending state */
 	if (global->waiting == false) { 
-
-		interval = &ol_p->intervals_data[global->snd_idx];
 		// printk(KERN_DEBUG "ytxing: tp:%p update_interval_info_snd\n", tp);
 		update_interval_info_snd(interval, tp);
-		if (ol_current_send_interval_ended(interval, tp)) {
-			// printk(KERN_DEBUG "ytxing: tp:%p ol_current_send_interval_ended\n", tp);
-			interval_process(global, tp);
-			// printk(KERN_DEBUG "ytxing: tp:%p interval_process\n", tp);
+		// update_interval_info_snd(meta_interval, meta_tp);
+		if (ol_all_subflow_send_interval_ended(meta_tp)){
+			if (!ol_current_send_interval_ended(meta_interval, meta_tp)){
+				printk(KERN_DEBUG "ytxing: meta_tp:%p BUG subflows end but not meta\n", meta_tp);
+				/* end the sending state this interval */
+				meta_interval->pkts_out_end = meta_tp->data_segs_out; /* sure? maybe for non-sack */
+				meta_interval->snd_seq_end = meta_tp->snd_nxt;
+				meta_interval->snd_time_end = meta_tp->tcp_mstamp;
+				meta_interval->snd_ended = true;
+			}
+			global->waiting = true;
 		}
+
 	}
 
 	/* handle interval in receiving state */ 
-	update_interval_info_rcv(global, tp);
+	update_interval_info_rcv(interval, tp); // TODO update all subflow info
+	update_interval_info_rcv(meta_interval, meta_tp);
 	// printk(KERN_DEBUG "ytxing: tp:%p update_interval_info_rcv\n", tp);
 	/* check if all intervals finish receiving */
-	if (all_receive_interval_ended(global, tp)){
+	if (all_receive_interval_ended(meta_sk)){
 		// printk(KERN_DEBUG "ytxing: tp:%p all_receive_interval_ended\n", tp);
 		printk(KERN_DEBUG "ytxing: tp:%p decide\n", tp);
 		/* decide new suggested ratio and OL_GLOBAL_STATE*/
-		if (global->state == OL_PROBE)
-			ol_probing_decide(meta_sk, sk);
-		else if (global->state == OL_MOVE)
-			ol_moving_decide(meta_sk, sk);
-		else if (global->state == OL_START)
-			ol_starting_decide(meta_sk, sk); 
-		else 
-			printk(KERN_DEBUG "ytxing: UNLIKELY tp %p has no valid OL_STATE\n", tcp_sk(sk));
+		ol_exp3_update(meta_sk, sk); // ytxing: TODO
+
 	}
 }
 
@@ -1335,15 +1164,23 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 	struct mptcp_tcp_sock *mptcp;
 	int active_valid_sks = -1;
 	struct sk_buff *skb;
-	struct sock *sk, *unavailable_sk;
+	struct sock *sk, *unavailable_sk, *gambler_sk;
 	// int found = 0;
-	int i = 0;
+	int i = 0, arm_idx;
 
+	
 	/* process ol model immediately, since sending nothing doesn't mean receiving nothing */
 	mptcp_for_each_sub(mpcb, mptcp) {
 		// printk(KERN_DEBUG "ytxing: tp:%p PROCESS\n", mptcp->tp);
 		ol_process(meta_sk, mptcp_to_sock(mptcp));
 	}
+	gambler_sk = ol_who_is_the_palyer(meta_sk);
+	arm_idx = pull_the_arm_accordingly(gambler_sk);
+
+	/* TODO if sk = gambler_sk, set interval according to arm_idx, changing 
+	 * if sk != gambler_sk, set the same red ratio, don't move
+	 */
+	
 
 	/* As we set it, we have to reset it as well. */
 	*limit = 0;
@@ -1451,37 +1288,38 @@ static void olsched_init(struct sock *sk)
 {
 	struct olsched_priv *ol_p = olsched_get_priv(tcp_sk(sk));
 	int i;
-	// struct olsched_cb *ol_cb = olsched_get_cb(tcp_sk(mptcp_meta_sk(sk)));
+	struct olsched_cb *ol_cb = olsched_get_cb(tcp_sk(mptcp_meta_sk(sk)));
 
-	ol_p->intervals_data = kzalloc(sizeof(struct ol_interval) * OLSCHED_INTERVALS_NUM * 2,
+	ol_cb->meta_interval = kzalloc(sizeof(struct ol_interval_MAB) * OLSCHED_INTERVALS_NUM * 2,
 				 GFP_KERNEL);
-	ol_p->global_data = kzalloc(sizeof(struct ol_global),
+
+	ol_p->intervals_data = kzalloc(sizeof(struct ol_interval_MAB) * OLSCHED_INTERVALS_NUM * 2,
+				 GFP_KERNEL);
+	ol_p->global_data = kzalloc(sizeof(struct ol_global_MAB),
+				 GFP_KERNEL);
+	ol_p->global_data->intervals_data = kzalloc(sizeof(struct ol_interval_MAB) * OLSCHED_INTERVALS_NUM * 2,
 				 GFP_KERNEL);
 	ol_p->global_data->red_ratio = OLSCHED_INIT_RED_RATIO;
-	ol_p->global_data->suggested_red_ratio = OLSCHED_INIT_RED_RATIO; /* should be 1 */
-	ol_p->global_data->previous_suggested_red_ratio = OLSCHED_INIT_RED_RATIO;
 	ol_p->global_data->state = OL_START;
 	ol_p->global_data->waiting = false;
 	ol_p->global_data->red_quota = 0;
 	ol_p->global_data->new_quota = 0;
-	ol_p->global_data->util_func = &ol_calc_utility;
 
 	for (i = 0; i < OLSCHED_INTERVALS_NUM; i++){
 		ol_p->intervals_data[i].index = i;
 		ol_p->intervals_data[i].init = 1;
+		ol_p->intervals_data[i].interval_duration = OLSCHED_INTERVALS_MIN_DURATION;
 	}
 
-	ol_p->intervals_data[0].utility = S64_MIN;
-	ol_p->intervals_data[0].previous_utility = S64_MIN;
-	ol_p->intervals_data[0].invalid_utility = 0; // 1 means this utility is not trustworthy, 0 otherwise
+	for (i = 0; i < OLSCHED_ARMS_NUM; i++){
+		ol_p->intervals_data[0]->arm_weight[i] = 1;
+	}
+	ol_update_arm_probality(sk);
 
-	ol_p->global_data->round = 0;
-	// printk(KERN_DEBUG "ytxing: olsched_init tp:%p ol_p->global_data->init:%d\n", tcp_sk(sk), ol_p->global_data->init);
+	/* should I pull an arm now? */
+	
 	ol_p->global_data->init = 1;
 
-	/* first try to move from 0 -> 1, for throughput TODO */
-	ol_setup_intervals_starting(tcp_sk(sk));
-	start_current_send_interval(tcp_sk(sk));
 
 	printk(KERN_DEBUG "ytxing: olsched_init tp:%p\n", tcp_sk(sk));
 	if(!tcp_is_sack(tcp_sk(sk)))
