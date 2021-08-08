@@ -222,31 +222,6 @@ static int olsched_get_active_valid_sks_num(struct sock *meta_sk)
 	return active_valid_sks;
 }
 
-
-/* ytxing:	1. bandwidth = cwnd * mss / rtt 
- *			2. bandwidth = delivered_byte / time_interval
- *			in Bps
- */
-static u64 olsched_get_bandwidth(struct sock *sk)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-	u32 rtt_us, mss_now; 
-	u64 bandwidth;
-
-	if (tp->srtt_us) {		/* any RTT sample yet? */
-		rtt_us = max(tp->srtt_us >> 3, 1U);
-	} else {			 /* no RTT sample yet */
-		return 0;
-	}
-	
-	mss_now = tcp_current_mss(sk);
-	bandwidth = (u64)tp->snd_cwnd * mss_now * USEC_PER_SEC;
-	do_div(bandwidth, rtt_us);
-		
-	// printk(KERN_DEBUG "ytxing: tp:%p bandwidth%llu rtt:%u(us) cwnd:%u\n", tp, bandwidth, rtt_us, tp->snd_cwnd);
-	return bandwidth; /* Bps */
-}
-
 /* ytxing:	1. bandwidth = cwnd * mss / rtt 
  *			2. bandwidth = delivered_byte / time_interval
  *			in Bps
@@ -289,11 +264,10 @@ static u64 olsched_get_loss_rate(struct ol_interval_MAB *interval)
 static void ol_setup_intervals_MAB(struct sock *sk, int arm_idx)
 {	
 	struct olsched_priv *ol_p = olsched_get_priv(tcp_sk(sk));
-	struct olsched_cb *ol_cb = olsched_get_cb(tcp_sk(sk));
-	struct ol_gambler_MAB *gambler = ol_cb->gambler;
+	// struct olsched_cb *ol_cb = olsched_get_cb(tcp_sk(sk));
+	// struct ol_gambler_MAB *gambler = ol_cb->gambler;
 	struct ol_global_MAB *global = ol_p->global_data;
-	struct ol_interval_MAB *interval = ol_p->intervals_data[0];
-	u16 arm_red_ratio;
+	struct ol_interval_MAB *interval = &ol_p->intervals_data[0];
 	if (arm_idx >=0 && arm_idx < OLSCHED_ARMS_NUM){
 		global->red_ratio = ol_arm_to_red_ratio[arm_idx];
 		interval->red_ratio = ol_arm_to_red_ratio[arm_idx];
@@ -307,6 +281,7 @@ static void ol_setup_intervals_MAB(struct sock *sk, int arm_idx)
 	global->waiting = false;
 }
 
+
 /* ytxing: TODO
  * Now we pick the gambler by Round-Robin, 
  * but maybe we should consider the loss rate or dRTT of the sk, 
@@ -314,11 +289,12 @@ static void ol_setup_intervals_MAB(struct sock *sk, int arm_idx)
  * and the slower one may pull the arm randomly using Exp3 algorithm.
  *
  */
-sock *ol_who_is_the_gambler(struct sock *meta_sk)
+struct sock *ol_who_is_the_gambler(struct sock *meta_sk)
 {
-	struct tcp_sock *meta_tp = tcp_sk(meta_sk), next_gambler_sk = NULL;
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
+	struct sock *next_gambler_sk = NULL;
 	struct olsched_priv *ol_p;
-	struct ol_global_MAB *global;
+	// struct ol_global_MAB *global;
 	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
 	struct ol_gambler_MAB *gambler = ol_cb->gambler;
 	struct mptcp_tcp_sock *mptcp;
@@ -402,11 +378,10 @@ bool ol_all_subflow_send_interval_ended(struct tcp_sock *meta_tp)
 	bool all_ended = true;
 
 	mptcp_for_each_sub(mpcb, mptcp) {
-		struct sock *sk = mptcp_to_sock(mptcp);		
 		struct tcp_sock *tp = mptcp->tp;
 		struct olsched_priv *ol_p = olsched_get_priv(tp);
 
-		all_ended = all_ended && ol_current_send_interval_ended(ol_p->intervals_data[0], tp);
+		all_ended = all_ended && ol_current_send_interval_ended(&ol_p->intervals_data[0], tp);
 	}
 
 	return all_ended;
@@ -435,14 +410,13 @@ bool all_receive_interval_ended(struct sock *meta_sk)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);	
 	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
-	struct ol_interval_MAB *meta_interval = ol_cb->meta_interval[0];
+	struct ol_interval_MAB *meta_interval = &ol_cb->meta_interval[0];
 	struct mptcp_tcp_sock *mptcp;
 	// struct ol_global *global = olsched_get_cb(meta_tp);
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
 	bool all_ended = true;
 
-	mptcp_for_each_sub(mpcb, mptcp) {
-		struct sock *sk = mptcp_to_sock(mptcp);		
+	mptcp_for_each_sub(mpcb, mptcp) {	
 		struct tcp_sock *tp = mptcp->tp;
 		struct olsched_priv *ol_p = olsched_get_priv(tp);
 
@@ -467,7 +441,7 @@ void start_current_send_interval(struct tcp_sock *tp)
 		global = ol_p->global_data;
 		interval = &ol_p->intervals_data[0];
 	} else {
-		interval = &olsched_get_cb(tp).meta_interval[0];
+		interval = &olsched_get_cb(tp)->meta_interval[0];
 	}
 	interval->snd_time_begin = tp->tcp_mstamp;
 	interval->snd_seq_begin = tp->snd_nxt;
@@ -492,9 +466,9 @@ void start_current_send_interval(struct tcp_sock *tp)
 
 void ol_update_arm_probality(struct sock *sk)
 {
-	struct tcp_sock *tp = tcp_sock(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct olsched_priv *ol_p = olsched_get_priv(tp);
-	struct ol_interval_MAB *interval = ol_p->intervals_data[0];
+	struct ol_interval_MAB *interval = &ol_p->intervals_data[0];
 	// struct ol_global_MAB *global = ol_p->global_data;
 
 	u32 arm_weight_sum = 0, gamma_over_K = (OLSCHED_UNIT * OLSCHED_GAMMA_MAB) / (OLSCHED_ARMS_NUM * OLSCHED_GAMMA_MAB_BASE);
@@ -516,15 +490,15 @@ void ol_update_arm_probality(struct sock *sk)
 
 u8 pull_the_arm_accordingly(struct sock *sk)
 {
-	struct tcp_sock *tp = tcp_sock(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct olsched_priv *ol_p = olsched_get_priv(tp);
-	struct ol_interval_MAB *interval = ol_p->intervals_data[0];
+	struct ol_interval_MAB *interval = &ol_p->intervals_data[0];
 	// struct ol_global_MAB *global = ol_p->global_data;
 	int arm_idx;
 	u16 random, probability_cumulated = 0;
 	get_random_bytes(&random, OLSCHED_SCALE - 1);
 	if (random > OLSCHED_UNIT)
-		printk(KERN_DEBUG "ytxing: tp:%p BUG random > OLSCHED_UNIT\n", tp3);
+		printk(KERN_DEBUG "ytxing: tp:%p BUG random > OLSCHED_UNIT\n", tp);
 
 	for (arm_idx = 0; arm_idx < OLSCHED_ARMS_NUM; arm_idx++){
 		probability_cumulated += interval->arm_probability[arm_idx];
@@ -538,16 +512,16 @@ u8 pull_the_arm_accordingly(struct sock *sk)
 
 u8 pull_the_arm_with_hi_probability(struct sock *sk)
 {
-	struct tcp_sock *tp = tcp_sock(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct olsched_priv *ol_p = olsched_get_priv(tp);
-	struct ol_interval_MAB *interval = ol_p->intervals_data[0];
+	struct ol_interval_MAB *interval = &ol_p->intervals_data[0];
 	// struct ol_global_MAB *global = ol_p->global_data;
 	int arm_idx, hi_arm_idx;
 	u16 random, probability_cumulated = 0;
 	u16 hi_probability = 0;
 	get_random_bytes(&random, OLSCHED_SCALE - 1);
 	if (random > OLSCHED_UNIT)
-		printk(KERN_DEBUG "ytxing: tp:%p BUG random > OLSCHED_UNIT\n", tp, interval->index, global->red_ratio >> 3);
+		printk(KERN_DEBUG "ytxing: tp:%p BUG random > OLSCHED_UNIT\n", tp);
 
 	for (arm_idx = 0; arm_idx < OLSCHED_ARMS_NUM; arm_idx++){
 		probability_cumulated += interval->arm_probability[arm_idx];
@@ -559,57 +533,6 @@ u8 pull_the_arm_with_hi_probability(struct sock *sk)
 
 	return arm_idx;
 }
-
-
-/* The Exp3 Algorithm: 
- * 1. set arm probability according to arm weight
- * 2. draw arm randomly according to the probabilities (curr_arm_idx)
- * 3. receive reward of the previous pulled arm (ol_exp3_decide start from here)
- * 4. for each arm, update their weights
- *
- *           1->2->3->4->1->2->3->4->1->2...
- * initialization | in this function
- *
- * this function update the MAB model of the gambler sk
- */
-static void ol_exp3_update(struct sock *meta_sk, struct sock *sk)
-{
-	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
-	struct tcp_sock *tp = tcp_sock(sk);
-	struct olsched_priv *ol_p = olsched_get_priv(tp);
-	struct mptcp_cb *mpcb = meta_tp->mpcb;
-	struct ol_interval_MAB *interval = ol_p->intervals_data[0];
-	struct ol_global_MAB *global = ol_p->global_data;
-	u32 reward, new_ratio;
-
-	/* update arm weight and probability */
-	interval->previous_arm_idx = interval->current_arm_idx;
-
-	/* receive reward from the network */
-	reward = ol_calc_reward(interval, sk); // reward << OLSCHED_SCALE, actually. Since 0 < reward <= 1. 
-	reward *= OLSCHED_UNIT; /* arm_probability is in OLSCHED_UNIT, so expand the dividend */
-	do_div(reward, interval->arm_probability[interval->previous_arm_idx]);
-	// interval->arm_weight[interval->previous_arm_idx] update;
-	reward *= OLSCHED_UNIT * OLSCHED_GAMMA_MAB;
-	do_div(reward, OLSCHED_ARMS_NUM * OLSCHED_GAMMA_MAB_BASE);
-
-	interval->arm_weight[interval->previous_arm_idx] *= ol_exp(reward); /* reward << OLSCHED_SCALE, actually */
-	/* Since arm_weight is stored in OLSCHED_UNIT, *= will multiply it to OLSCHED_UNIT^2 */
-	interval->arm_weight[interval->previous_arm_idx] >>= OLSCHED_SCALE;
-
-	/* update the probility of previous arm accordingly */
-	ol_update_arm_probality(sk);
-
-	/* maybe don't pull the arm immediately, 
-	 * since only one tp is allowed to change its behavior at the same time.
-	 * TODO
-	 */
-	// interval->current_arm_idx = pull_the_arm_accordingly(sk);
-	
-	// start_current_send_interval(tp);
-}
-
-
 
 static void update_interval_info_snd(struct ol_interval_MAB *interval, struct tcp_sock *tp)
 {
@@ -626,12 +549,11 @@ static void update_all_subflow_interval_info_snd(struct tcp_sock *meta_tp)
 	struct mptcp_tcp_sock *mptcp;
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
 
-	mptcp_for_each_sub(mpcb, mptcp) {
-		struct sock *sk = mptcp_to_sock(mptcp);		
+	mptcp_for_each_sub(mpcb, mptcp) {	
 		struct tcp_sock *tp = mptcp->tp;
 		struct olsched_priv *ol_p = olsched_get_priv(tp);
 
-		update_interval_info_snd(ol_p->intervals_data[0], tp);
+		update_interval_info_snd(&ol_p->intervals_data[0], tp);
 	}
 
 }
@@ -642,7 +564,7 @@ static void update_all_subflow_interval_info_snd(struct tcp_sock *meta_tp)
  */
 static void update_interval_info_rcv(struct ol_interval_MAB *interval, struct tcp_sock *tp)
 {
-	struct olsched_priv *ol_p = olsched_get_priv(tp);
+	// struct olsched_priv *ol_p = olsched_get_priv(tp);
 	
 	u32 current_interval_known_seq = interval->known_seq;
 	interval->known_seq = tp->snd_una;
@@ -660,8 +582,7 @@ static void update_interval_info_rcv(struct ol_interval_MAB *interval, struct tc
 		interval->rcv_time_end = tp->tcp_mstamp;
 		interval->rcv_ended = true;
 		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u lost:%u known:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_end, interval->lost_end - interval->lost_begin, interval->known_seq);
-		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->rcv_time_begin, olsched_get_bandwidth_interval(interval));
-		// interval->delivered_end = tp->delivered; /* sure? delivered is not reliable with sack since it might contain some pkts of other intervals*/
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->rcv_time_begin, olsched_get_bandwidth_interval(interval, tp));
 	}
 
 }
@@ -695,19 +616,18 @@ static void olsched_check_quota(struct tcp_sock *tp,
  */
 static u64 ol_calc_reward(struct ol_interval_MAB *curr_interval, struct sock *curr_sk) {
 	struct sock *meta_sk = mptcp_meta_sk(curr_sk);
-	struct tcp_sock *meta_tp = tcp_sk(meta_sk), *curr_tp = tcp_sk(curr_sk);	
-	struct mptcp_tcp_sock *mptcp;
-	struct mptcp_cb *mpcb = meta_tp->mpcb;
-	struct olsched_priv *curr_ol_p = olsched_get_priv(curr_tp);
-	struct ol_interval_MAB *meta_interval = curr_ol_p->global_data->intervals_data[0];
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
+	struct mptcp_cb *mpcb = meta_tp->mpcb;	
+	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct ol_interval_MAB *meta_interval = ol_cb->meta_interval;
 	struct ol_interval_MAB *interval;
-	// struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct mptcp_tcp_sock *mptcp;
 
 	u64 subflow_throughput_sum = 0, meta_throughput;
 	u64 reward;
 
 
-	meta_throughput = olsched_get_bandwidth_interval(meta_interval);
+	meta_throughput = olsched_get_bandwidth_interval(meta_interval, meta_tp);
 
 
 	/* ytxing:	in this loop, we 
@@ -717,14 +637,13 @@ static u64 ol_calc_reward(struct ol_interval_MAB *curr_interval, struct sock *cu
 		struct sock *sk = mptcp_to_sock(mptcp);		
 		struct tcp_sock *tp = mptcp->tp;
 		struct olsched_priv *ol_p;
-		u64 bw_t;
 
 		if (!subflow_is_active(tp) || mptcp_is_def_unavailable(sk)) /* we ignore unavailable subflows*/
 			continue;
 
 		ol_p = olsched_get_priv(tp);
-		interval = ol_p->intervals_data[0];
-		subflow_throughput_sum += olsched_get_bandwidth_interval(interval);
+		interval = &ol_p->intervals_data[0];
+		subflow_throughput_sum += olsched_get_bandwidth_interval(interval, tp);
 	}
 	if (subflow_throughput_sum == 0)
 		return 0;
@@ -733,6 +652,50 @@ static u64 ol_calc_reward(struct ol_interval_MAB *curr_interval, struct sock *cu
 	return reward;
 }
 
+/* The Exp3 Algorithm: 
+ * 1. set arm probability according to arm weight
+ * 2. draw arm randomly according to the probabilities (curr_arm_idx)
+ * 3. receive reward of the previous pulled arm (ol_exp3_decide start from here)
+ * 4. for each arm, update their weights
+ *
+ *           1->2->3->4->1->2->3->4->1->2...
+ * initialization | in this function
+ *
+ * this function update the MAB model of the gambler sk
+ */
+static void ol_exp3_update(struct sock *meta_sk, struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct olsched_priv *ol_p = olsched_get_priv(tp);
+	struct ol_interval_MAB *interval = &ol_p->intervals_data[0];
+	u32 reward;
+
+	/* update arm weight and probability */
+	interval->previous_arm_idx = interval->current_arm_idx;
+
+	/* receive reward from the network */
+	reward = ol_calc_reward(interval, sk); // reward << OLSCHED_SCALE, actually. Since 0 < reward <= 1. 
+	reward *= OLSCHED_UNIT; /* arm_probability is in OLSCHED_UNIT, so expand the dividend */
+	do_div(reward, interval->arm_probability[interval->previous_arm_idx]);
+	// interval->arm_weight[interval->previous_arm_idx] update;
+	reward *= OLSCHED_UNIT * OLSCHED_GAMMA_MAB;
+	do_div(reward, OLSCHED_ARMS_NUM * OLSCHED_GAMMA_MAB_BASE);
+
+	interval->arm_weight[interval->previous_arm_idx] *= ol_exp(reward); /* reward << OLSCHED_SCALE, actually */
+	/* Since arm_weight is stored in OLSCHED_UNIT, *= will multiply it to OLSCHED_UNIT^2 */
+	interval->arm_weight[interval->previous_arm_idx] >>= OLSCHED_SCALE;
+
+	/* update the probility of previous arm accordingly */
+	ol_update_arm_probality(sk);
+
+	/* maybe don't pull the arm immediately, 
+	 * since only one tp is allowed to change its behavior at the same time.
+	 * TODO
+	 */
+	// interval->current_arm_idx = pull_the_arm_accordingly(sk);
+	
+	// start_current_send_interval(tp);
+}
 
 /* was the ol struct fully inited */
 bool ol_valid(struct olsched_priv *ol_p)
@@ -750,7 +713,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 	// struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
 
 	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
-	struct ol_interval_MAB *meta_interval = ol_cb->meta_interval[0];
+	struct ol_interval_MAB *meta_interval = &ol_cb->meta_interval[0];
 	struct olsched_priv *ol_p;
 	struct ol_global_MAB *global;
 	struct ol_gambler_MAB *gambler;
@@ -763,8 +726,8 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 
 	mptcp_for_each_sub(mpcb, mptcp) {
 		sk = mptcp_to_sock(mptcp);
-		tp = tcp_sock(sk);
-		interval = ol_p->intervals_data[0];
+		tp = tcp_sk(sk);
+		interval = &ol_p->intervals_data[0];
 		global = ol_p->global_data;
 
 		/* maybe some checking? */
@@ -794,7 +757,6 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 				printk(KERN_DEBUG "ytxing: meta_tp:%p BUG subflows end but not meta\n", meta_tp);
 			}
 		}
-
 	}
 	
 	/* RCV INFO META */
@@ -815,7 +777,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 	mptcp_for_each_sub(mpcb, mptcp) {
 		// printk(KERN_DEBUG "ytxing: tp:%p PROCESS\n", mptcp->tp);
 		sk = mptcp_to_sock(mptcp);
-		ol_p = olsched_get_priv(tcp_sock(sk));
+		ol_p = olsched_get_priv(tcp_sk(sk));
 		global = ol_p->global_data;
 		if (sk == gambler->gambler_sk){
 			ol_setup_intervals_MAB(sk, pull_the_arm_accordingly(sk));
@@ -825,11 +787,12 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 			ol_setup_intervals_MAB(sk, pull_the_arm_with_hi_probability(sk));
 			global->state = OL_STAY;
 		}
-		start_current_send_interval(tcp_sock(sk));
+		start_current_send_interval(tcp_sk(sk));
 	}
-	start_current_send_interval(tcp_sock(meta_sk));
+	start_current_send_interval(tcp_sk(meta_sk));
 
 }
+
 
 
 static bool olsched_use_subflow(struct sock *meta_sk,
@@ -1169,17 +1132,16 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
 	struct olsched_priv *ol_p;
 	struct tcp_sock *tp;
-	struct mptcp_tcp_sock *mptcp;
 	int active_valid_sks = -1;
 	struct sk_buff *skb;
-	struct sock *sk, *unavailable_sk, *gambler_sk;
+	struct sock *sk, *unavailable_sk;
 	// int found = 0;
-	int i = 0, arm_idx;
+	int i = 0;
 	bool all_interval_ended;
 
 	
 	/* process ol model immediately, since sending nothing doesn't mean receiving nothing */
-	ol_process_all_subflows(meta_sk, &all_interval_ended)	
+	ol_process_all_subflows(meta_sk, &all_interval_ended);
 	
 
 	/* As we set it, we have to reset it as well. */
@@ -1307,13 +1269,13 @@ static void olsched_init(struct sock *sk)
 		ol_p->intervals_data[i].init = 1;
 		ol_p->intervals_data[i].interval_duration = OLSCHED_INTERVALS_MIN_DURATION;
 	}
-	ol_cb->meta_interval.index = 0;
-	ol_cb->meta_interval.init = 1;
-	ol_cb->meta_interval.interval_duration = OLSCHED_INTERVALS_MIN_DURATION;
+	ol_cb->meta_interval->index = 0;
+	ol_cb->meta_interval->init = 1;
+	ol_cb->meta_interval->interval_duration = OLSCHED_INTERVALS_MIN_DURATION;
 	
 
 	for (i = 0; i < OLSCHED_ARMS_NUM; i++){
-		ol_p->intervals_data[0]->arm_weight[i] = 1;
+		ol_p->intervals_data[0].arm_weight[i] = 1;
 	}
 	ol_update_arm_probality(sk);
 
