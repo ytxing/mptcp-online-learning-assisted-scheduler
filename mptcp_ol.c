@@ -484,6 +484,7 @@ void ol_update_arm_probality(struct sock *sk)
 		temp *= OLSCHED_GAMMA_MAB_BASE - OLSCHED_GAMMA_MAB;
 		temp /= OLSCHED_GAMMA_MAB_BASE;
 		interval->arm_probability[i] = temp + gamma_over_K;
+		printk(KERN_DEBUG "ytxing: tp:%p arm_probability[%d]:%u/1024\n", tp, i, interval->arm_probability[i] >> 3);
 	}
 
 }
@@ -506,7 +507,6 @@ u8 pull_the_arm_accordingly(struct sock *sk)
 			break;
 		}
 	}
-
 	return arm_idx;
 }
 
@@ -700,7 +700,7 @@ static void ol_exp3_update(struct sock *meta_sk, struct sock *sk)
 /* was the ol struct fully inited */
 bool ol_valid(struct olsched_priv *ol_p)
 {	
-	return (ol_p && ol_p->global_data && ol_p->intervals_data && ol_p->global_data->init == 1 && ol_p->intervals_data[0].init == 1);
+	return (ol_p && ol_p->global_data && ol_p->intervals_data);
 }
 
 /* Updates the OL model of one sk */
@@ -721,6 +721,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 	
 	struct mptcp_tcp_sock *mptcp;
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
+	u8 arm_idx;
 
 	*all_interval_ended = false;
 
@@ -780,11 +781,15 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 		ol_p = olsched_get_priv(tcp_sk(sk));
 		global = ol_p->global_data;
 		if (sk == gambler->gambler_sk){
-			ol_setup_intervals_MAB(sk, pull_the_arm_accordingly(sk));
+			arm_idx = pull_the_arm_accordingly(sk);
+			printk(KERN_DEBUG "ytxing: tp:%p is the gambler arm_idx = %u\n", mptcp->tp, arm_idx);
+			ol_setup_intervals_MAB(sk, arm_idx);
 			global->state = OL_PULL;
 		}
 		else{
-			ol_setup_intervals_MAB(sk, pull_the_arm_with_hi_probability(sk));
+			arm_idx = pull_the_arm_with_hi_probability(sk);
+			printk(KERN_DEBUG "ytxing: tp:%p is not the gambler arm_idx = %u\n", mptcp->tp, arm_idx);
+			ol_setup_intervals_MAB(sk, arm_idx);
 			global->state = OL_STAY;
 		}
 		start_current_send_interval(tcp_sk(sk));
@@ -1252,8 +1257,6 @@ static void olsched_init(struct sock *sk)
 	int i;
 	struct olsched_cb *ol_cb = olsched_get_cb(tcp_sk(mptcp_meta_sk(sk)));
 
-	ol_cb->meta_interval = kzalloc(sizeof(struct ol_interval_MAB) * OLSCHED_INTERVALS_NUM, GFP_KERNEL);
-	ol_cb->gambler = kzalloc(sizeof(struct ol_gambler_MAB), GFP_KERNEL);
 
 	ol_p->intervals_data = kzalloc(sizeof(struct ol_interval_MAB) * OLSCHED_INTERVALS_NUM, GFP_KERNEL);
 	ol_p->global_data = kzalloc(sizeof(struct ol_global_MAB), GFP_KERNEL);
@@ -1268,10 +1271,20 @@ static void olsched_init(struct sock *sk)
 		ol_p->intervals_data[i].index = i;
 		ol_p->intervals_data[i].init = 1;
 		ol_p->intervals_data[i].interval_duration = OLSCHED_INTERVALS_MIN_DURATION;
+		ol_p->intervals_data[i].snd_ended = false;
+		ol_p->intervals_data[i].rcv_ended = false;
 	}
-	ol_cb->meta_interval->index = 0;
-	ol_cb->meta_interval->init = 1;
-	ol_cb->meta_interval->interval_duration = OLSCHED_INTERVALS_MIN_DURATION;
+
+	if (!ol_cb->meta_interval){
+		ol_cb->meta_interval = kzalloc(sizeof(struct ol_interval_MAB) * OLSCHED_INTERVALS_NUM, GFP_KERNEL);
+		ol_cb->meta_interval->index = 0;
+		ol_cb->meta_interval->init = 1;
+		ol_cb->meta_interval->interval_duration = OLSCHED_INTERVALS_MIN_DURATION;
+		ol_cb->meta_interval->snd_ended = false;
+		ol_cb->meta_interval->rcv_ended = false;
+		ol_cb->meta_interval->snd_seq_begin = 0;
+		printk(KERN_DEBUG "ytxing: olsched_init meta_tp:%p\n", tcp_sk(mptcp_meta_sk(sk)));
+	}
 	
 
 	for (i = 0; i < OLSCHED_ARMS_NUM; i++){
@@ -1280,8 +1293,18 @@ static void olsched_init(struct sock *sk)
 	ol_update_arm_probality(sk);
 
 	/* should I pull an arm now? */
+	if (!ol_cb->gambler) {
+		ol_cb->gambler = kzalloc(sizeof(struct ol_gambler_MAB), GFP_KERNEL);
+		ol_cb->gambler->round = OLSCHED_GAME_ROUND;
+		ol_cb->gambler->gambler_sk = sk;
+	}
 	
 	ol_p->global_data->init = 1;
+
+	start_current_send_interval(tcp_sk(sk));
+	if (ol_cb->meta_interval->snd_seq_begin == 0){
+		start_current_send_interval(tcp_sk(mptcp_meta_sk(sk))); 
+	}
 
 
 	printk(KERN_DEBUG "ytxing: olsched_init tp:%p\n", tcp_sk(sk));
