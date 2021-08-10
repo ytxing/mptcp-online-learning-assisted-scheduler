@@ -51,7 +51,7 @@ typedef __s64 s64;
 
 
 /* ytxing: for utility function calculation */
-#define OLSCHED_GAMMA_MAB 99 /* div by OLSCHED_GAMMA_MAB_BASE */ 
+#define OLSCHED_GAMMA_MAB 50 /* div by OLSCHED_GAMMA_MAB_BASE */ 
 #define OLSCHED_GAMMA_MAB_BASE 100
 
 static const u16 ol_arm_to_red_ratio[OLSCHED_ARMS_NUM] = {
@@ -232,9 +232,12 @@ static u64 olsched_get_bandwidth_interval(struct ol_interval_MAB *interval, stru
 	u32 mss = tp->mss_cache;
 	u64 byte_rcv = (interval->delivered_end - interval->delivered_begin) * mss;
 	u64 duration = interval->rcv_time_end - interval->rcv_time_begin; 
-	if (duration <= 0 || byte_rcv <= 0)
+	if (duration <= 0)
 		return 0;
-
+	if (byte_rcv == 0 && is_meta_tp(tp)){
+		byte_rcv = interval->snd_seq_end - interval->snd_seq_begin;
+	}
+	// printk(KERN_INFO "ytxing: tp:%p get bandwidth dl_bytes:%llu seq_bytes:%llu\n", tp, (interval->delivered_end - interval->delivered_begin) * mss, interval->snd_seq_end - interval->snd_seq_begin);
 	bandwidth = byte_rcv * USEC_PER_SEC;
 	do_div(bandwidth, duration); /* delivery rate, actually */
 	return bandwidth; /* Bps */
@@ -263,18 +266,17 @@ static u64 olsched_get_loss_rate(struct ol_interval_MAB *interval)
 /* tweak the suggested ratio and setup four intervals */
 static void ol_setup_intervals_MAB(struct sock *sk, int arm_idx)
 {	
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct olsched_priv *ol_p = olsched_get_priv(tcp_sk(sk));
-	// struct olsched_cb *ol_cb = olsched_get_cb(tcp_sk(sk));
-	// struct ol_gambler_MAB *gambler = ol_cb->gambler;
 	struct ol_global_MAB *global = ol_p->global_data;
 	struct ol_interval_MAB *interval = &ol_p->intervals_data[0];
+	if (!ol_p || !global || !interval){
+		return;
+	}
 	if (arm_idx >=0 && arm_idx < OLSCHED_ARMS_NUM){
 		global->red_ratio = ol_arm_to_red_ratio[arm_idx];
 		interval->red_ratio = ol_arm_to_red_ratio[arm_idx];
-	} else {
-		/* WTF? */
 	}
-
 
 	global->snd_idx = 0;
 	global->rcv_idx = 0;
@@ -364,7 +366,7 @@ bool ol_current_send_interval_ended(struct ol_interval_MAB *interval, struct tcp
 	interval->snd_seq_end = tp->snd_nxt;
 	interval->snd_time_end = tp->tcp_mstamp;
 	interval->snd_ended = true;
-	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END packets_sent:%u\n", tp, interval->index, packets_sent);
+	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END packets_sent:%u seq_sent:%u\n", tp, interval->index, packets_sent, interval->snd_seq_end - interval->snd_seq_begin);
 	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END actual_duration:%llu interval_duration:%u\n", tp, interval->index, interval->snd_time_end - interval->snd_time_begin, interval_duration);
 	return true;
 }
@@ -457,7 +459,7 @@ void start_current_send_interval(struct tcp_sock *tp)
 		return;
 	}
 	
-	/* when a interval is active, the global ratio is set to the interval's ratio */
+	/* when a interval is active, the global ratio is set to the interval's ratio, then check_quota use global infomation */
 	global->waiting = false;
 	global->red_ratio = interval->red_ratio; 
 
@@ -496,8 +498,9 @@ u8 pull_the_arm_accordingly(struct sock *sk)
 	struct ol_interval_MAB *interval = &ol_p->intervals_data[0];
 	// struct ol_global_MAB *global = ol_p->global_data;
 	int arm_idx;
-	u16 random, probability_cumulated = 0;
-	get_random_bytes(&random, OLSCHED_SCALE - 1);
+	u16 random = 555, probability_cumulated = 0, random_mask = OLSCHED_UNIT - 1;
+	get_random_bytes(&random, sizeof(random));
+	random = random & random_mask;
 	if (random > OLSCHED_UNIT)
 		printk(KERN_DEBUG "ytxing: tp:%p BUG random > OLSCHED_UNIT\n", tp);
 
@@ -517,14 +520,9 @@ u8 pull_the_arm_with_hi_probability(struct sock *sk)
 	struct ol_interval_MAB *interval = &ol_p->intervals_data[0];
 	// struct ol_global_MAB *global = ol_p->global_data;
 	int arm_idx, hi_arm_idx;
-	u16 random, probability_cumulated = 0;
 	u16 hi_probability = 0;
-	get_random_bytes(&random, OLSCHED_SCALE - 1);
-	if (random > OLSCHED_UNIT)
-		printk(KERN_DEBUG "ytxing: tp:%p BUG random > OLSCHED_UNIT\n", tp);
 
 	for (arm_idx = 0; arm_idx < OLSCHED_ARMS_NUM; arm_idx++){
-		probability_cumulated += interval->arm_probability[arm_idx];
 		if (interval->arm_probability[arm_idx] > hi_probability){
 			hi_probability = interval->arm_probability[arm_idx];
 			hi_arm_idx = arm_idx;
@@ -536,12 +534,17 @@ u8 pull_the_arm_with_hi_probability(struct sock *sk)
 
 static void update_interval_info_snd(struct ol_interval_MAB *interval, struct tcp_sock *tp)
 {
+	if (!tp->snd_nxt){
+		printk(KERN_DEBUG "ytxing: tp:%p BUG !meta_tp->snd_nxt\n", tp);
+		return;
+	}
+
 	interval->snd_seq_end = tp->snd_nxt;
 
 	if(interval->snd_time_begin == 0)
 		interval->snd_time_begin = tp->tcp_mstamp;
 
-	// printk(KERN_DEBUG "ytxing: tp:%p idx: %u snd_seq: %u->%u(%u)\n", tp, interval->index, interval->snd_seq_begin, interval->snd_seq_end, interval->snd_seq_end - interval->snd_seq_begin);
+	// printk(KERN_DEBUG "ytxing: tp:%p idx: %u snd_seq:%u->%u(%u)\n", tp, interval->index, interval->snd_seq_begin, interval->snd_seq_end, interval->snd_seq_end - interval->snd_seq_begin);
 }
 
 static void update_all_subflow_interval_info_snd(struct tcp_sock *meta_tp)
@@ -568,7 +571,6 @@ static void update_interval_info_rcv(struct ol_interval_MAB *interval, struct tc
 	
 	u32 current_interval_known_seq = interval->known_seq;
 	interval->known_seq = tp->snd_una;
-	
 	/* ytxing: if this interval just start receiving pkts for the first time */
 	if (!after(current_interval_known_seq, interval->snd_seq_begin) && after(interval->known_seq, interval->snd_seq_begin)) {
 		interval->delivered_begin = tp->delivered;
@@ -581,7 +583,7 @@ static void update_interval_info_rcv(struct ol_interval_MAB *interval, struct tc
 		interval->lost_end = tp->lost;
 		interval->rcv_time_end = tp->tcp_mstamp;
 		interval->rcv_ended = true;
-		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u lost:%u known:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_end, interval->lost_end - interval->lost_begin, interval->known_seq);
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u(%ubytes) lost:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, (interval->delivered_end - interval->delivered_begin) * 1428, interval->lost_end - interval->lost_begin, tp->srtt_us >> 3);
 		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->rcv_time_begin, olsched_get_bandwidth_interval(interval, tp));
 	}
 
@@ -628,6 +630,7 @@ static u64 ol_calc_reward(struct ol_interval_MAB *curr_interval, struct sock *cu
 
 
 	meta_throughput = olsched_get_bandwidth_interval(meta_interval, meta_tp);
+	printk(KERN_DEBUG "ytxing: tp:%p (gambler) calc reward meta_throughput:%llu\n", tcp_sk(ol_cb->gambler->gambler_sk), meta_throughput);
 
 
 	/* ytxing:	in this loop, we 
@@ -645,10 +648,13 @@ static u64 ol_calc_reward(struct ol_interval_MAB *curr_interval, struct sock *cu
 		interval = &ol_p->intervals_data[0];
 		subflow_throughput_sum += olsched_get_bandwidth_interval(interval, tp);
 	}
+	printk(KERN_DEBUG "ytxing: tp:%p (gambler) calc reward subflow_throughput_sum:%llu\n", tcp_sk(ol_cb->gambler->gambler_sk), subflow_throughput_sum);
+
 	if (subflow_throughput_sum == 0)
 		return 0;
 	reward = meta_throughput * OLSCHED_UNIT;
 	do_div(reward, subflow_throughput_sum);
+	printk(KERN_DEBUG "ytxing: tp:%p (gambler) reward:%llu/1024\n", tcp_sk(ol_cb->gambler->gambler_sk), reward >> 3);
 	return reward;
 }
 
@@ -663,7 +669,7 @@ static u64 ol_calc_reward(struct ol_interval_MAB *curr_interval, struct sock *cu
  *
  * this function update the MAB model of the gambler sk
  */
-static void ol_exp3_update(struct sock *meta_sk, struct sock *sk)
+static void ol_exp3_update(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct olsched_priv *ol_p = olsched_get_priv(tp);
@@ -700,13 +706,12 @@ static void ol_exp3_update(struct sock *meta_sk, struct sock *sk)
 /* was the ol struct fully inited */
 bool ol_valid(struct olsched_priv *ol_p)
 {	
-	return (ol_p && ol_p->global_data && ol_p->intervals_data);
+	return (ol_p && ol_p->global_data && ol_p->intervals_data && ol_p->intervals_data[0].init && ol_p->global_data->init);
 }
 
 /* Updates the OL model of one sk */
 static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_ended)
 {
-
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct sock *sk;
 	struct tcp_sock *tp;
@@ -716,7 +721,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 	struct ol_interval_MAB *meta_interval = &ol_cb->meta_interval[0];
 	struct olsched_priv *ol_p;
 	struct ol_global_MAB *global;
-	struct ol_gambler_MAB *gambler;
+	struct ol_gambler_MAB *gambler = ol_cb->gambler;
 	struct ol_interval_MAB *interval; // ytxing: snd_idx should always be 0 with MAB
 	
 	struct mptcp_tcp_sock *mptcp;
@@ -726,18 +731,22 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 	*all_interval_ended = false;
 
 	mptcp_for_each_sub(mpcb, mptcp) {
+		
 		sk = mptcp_to_sock(mptcp);
 		tp = tcp_sk(sk);
+		ol_p = olsched_get_priv(tp);
 		interval = &ol_p->intervals_data[0];
 		global = ol_p->global_data;
 
-		/* maybe some checking? */
-		if (!ol_valid(ol_p))
-			return;
-
+		if (mptcp_is_def_unavailable(sk)){
+			continue;
+		}
+		if (!ol_valid(ol_p)){
+			continue;
+		}
+		
 		/* SND INFO */
 		if (interval->snd_ended == false){ // if meta_interval finishes sending, all snd interval should be ended
-			// printk(KERN_DEBUG "ytxing: tp:%p update_interval_info_snd\n", tp);
 			update_interval_info_snd(interval, tp);
 			if (ol_current_send_interval_ended(interval, tp)){
 				global->waiting = true;
@@ -746,7 +755,6 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 
 		/* RCV INFO */
 		update_interval_info_rcv(interval, tp); // TODO update all subflow info
-		// printk(KERN_DEBUG "ytxing: tp:%p update_interval_info_rcv\n", tp);
 		receive_interval_ended(interval);
 	}
 
@@ -768,11 +776,14 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 	}
 
 	*all_interval_ended = true;
-	ol_exp3_update(meta_sk, gambler->gambler_sk);
+	if (gambler == NULL)
+		return;
+	ol_exp3_update(gambler->gambler_sk);
 	gambler->round--;
 	if (gambler->round == 0){
 		gambler->gambler_sk = ol_who_is_the_gambler(meta_sk);
 		gambler->round = OLSCHED_GAME_ROUND;
+		printk(KERN_DEBUG "ytxing: tp:%p new gambler\n", tcp_sk(gambler->gambler_sk));
 	}
 
 	mptcp_for_each_sub(mpcb, mptcp) {
@@ -780,22 +791,30 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 		sk = mptcp_to_sock(mptcp);
 		ol_p = olsched_get_priv(tcp_sk(sk));
 		global = ol_p->global_data;
+
+		if (mptcp_is_def_unavailable(sk)){
+			continue;
+		}
+		if (!ol_valid(ol_p)){
+			continue;
+		}
+///////////////////////////////////////////////////////////////////////
 		if (sk == gambler->gambler_sk){
 			arm_idx = pull_the_arm_accordingly(sk);
-			printk(KERN_DEBUG "ytxing: tp:%p is the gambler arm_idx = %u\n", mptcp->tp, arm_idx);
+			printk(KERN_DEBUG "ytxing: tp:%p is the gambler arm_idx:%u\n", mptcp->tp, arm_idx);
 			ol_setup_intervals_MAB(sk, arm_idx);
 			global->state = OL_PULL;
 		}
 		else{
 			arm_idx = pull_the_arm_with_hi_probability(sk);
-			printk(KERN_DEBUG "ytxing: tp:%p is not the gambler arm_idx = %u\n", mptcp->tp, arm_idx);
+			printk(KERN_DEBUG "ytxing: tp:%p is not the gambler arm_idx:%u\n", mptcp->tp, arm_idx);
 			ol_setup_intervals_MAB(sk, arm_idx);
 			global->state = OL_STAY;
 		}
 		start_current_send_interval(tcp_sk(sk));
 	}
 	start_current_send_interval(tcp_sk(meta_sk));
-
+////////////////////////////////////////////////////////////////////////
 }
 
 
@@ -1271,6 +1290,7 @@ static void olsched_init(struct sock *sk)
 		ol_p->intervals_data[i].index = i;
 		ol_p->intervals_data[i].init = 1;
 		ol_p->intervals_data[i].interval_duration = OLSCHED_INTERVALS_MIN_DURATION;
+		ol_p->intervals_data[i].red_ratio = OLSCHED_INIT_RED_RATIO;
 		ol_p->intervals_data[i].snd_ended = false;
 		ol_p->intervals_data[i].rcv_ended = false;
 	}
@@ -1292,7 +1312,7 @@ static void olsched_init(struct sock *sk)
 	}
 	ol_update_arm_probality(sk);
 
-	/* should I pull an arm now? */
+	/* if this is the first tp initiated, it will be the first gambler. */
 	if (!ol_cb->gambler) {
 		ol_cb->gambler = kzalloc(sizeof(struct ol_gambler_MAB), GFP_KERNEL);
 		ol_cb->gambler->round = OLSCHED_GAME_ROUND;
