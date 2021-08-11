@@ -36,6 +36,7 @@ typedef __s64 s64;
 #define OLSCHED_INTERVAL_MIN_PACKETS 30
 
 #define OLSCHED_ARMS_NUM 4
+#define OLSCHED_MAX_WEIGHT 0x000000ffffffffff /* u32 */
 #define OLSCHED_GAME_ROUND 4
 
 #define OLSCHED_SCALE 13
@@ -51,7 +52,7 @@ typedef __s64 s64;
 
 
 /* ytxing: for utility function calculation */
-#define OLSCHED_GAMMA_MAB 50 /* div by OLSCHED_GAMMA_MAB_BASE */ 
+#define OLSCHED_GAMMA_MAB 20 /* div by OLSCHED_GAMMA_MAB_BASE */ 
 #define OLSCHED_GAMMA_MAB_BASE 100
 
 static const u16 ol_arm_to_red_ratio[OLSCHED_ARMS_NUM] = {
@@ -124,6 +125,8 @@ struct ol_global_MAB {
 	u16	new_quota;	// ytxing: how many new pkts should this subflow send
 	u16	red_ratio;	// ytxing: the ratio to calculate current quota, the same as the red_ratio current interval >> OLSCHED_SCALE
 
+	u32 last_time_delivered; /* pkts */
+
 	/* intervals info */
 	u8	snd_idx:4, 	// ytxing: the interval index currently sending pkts (< OLSCHED_INTERVALS_NUM)
 		rcv_idx:4;	// ytxing: the interval index currently receiving pkts (< OLSCHED_INTERVALS_NUM)
@@ -141,7 +144,7 @@ struct ol_global_MAB {
 struct ol_gambler_MAB {
 	u8 previous_arm_idx;
 	u8 current_arm_idx;
-	u32 arm_weight[OLSCHED_ARMS_NUM];
+	u64 arm_weight[OLSCHED_ARMS_NUM];
 	u16 arm_probability[OLSCHED_ARMS_NUM];
 };
 
@@ -274,7 +277,8 @@ static void ol_setup_intervals_MAB(struct sock *sk, int arm_idx)
 		global->red_ratio = ol_arm_to_red_ratio[arm_idx];
 		interval->red_ratio = ol_arm_to_red_ratio[arm_idx];
 	}
-
+	
+	global->last_time_delivered = interval->delivered_end - interval->delivered_begin;
 	global->snd_idx = 0;
 	global->rcv_idx = 0;
 	global->waiting = false;
@@ -305,8 +309,8 @@ bool ol_current_send_interval_ended(struct ol_interval_MAB *interval, struct tcp
 	interval->snd_seq_end = tp->snd_nxt;
 	interval->snd_time_end = tp->tcp_mstamp;
 	interval->snd_ended = true;
-	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END packets_sent:%u\n", tp, interval->index, packets_sent);
-	printk(KERN_INFO "ytxing: tp:%p idx:%d SND END actual_duration:%llu interval_duration:%u\n", tp, interval->index, interval->snd_time_end - interval->snd_time_begin, interval_duration);
+	printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END packets_sent:%u\n", tp, is_meta_tp(tp), interval->index, packets_sent);
+	printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END actual_duration:%llu interval_duration:%u\n", tp, is_meta_tp(tp), interval->index, interval->snd_time_end - interval->snd_time_begin, interval_duration);
 	return true;
 }
 
@@ -525,7 +529,7 @@ static void update_interval_info_rcv(struct ol_interval_MAB *interval, struct tc
 		interval->lost_end = tp->lost;
 		interval->rcv_time_end = tp->tcp_mstamp;
 		interval->rcv_ended = true;
-		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u lost:%u known:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, interval->known_seq);
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u lost:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, tp->srtt_us >> 3);
 		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->rcv_time_begin, olsched_get_bandwidth_interval(interval, tp));
 	}
 
@@ -540,14 +544,15 @@ static void olsched_check_quota(struct tcp_sock *tp,
 					  struct olsched_priv *ol_p, bool force)
 {
 	struct ol_global_MAB *global = ol_p->global_data;
+	u32 total_pkts = global->last_time_delivered;
 	// struct ol_interval *curr_interval = NULL;
 	// if (global->snd_idx < OLSCHED_INTERVALS_NUM)
 	// 	curr_interval = ol_p->intervals_data[global->snd_idx];
 	// still has quota, no need to calculate again
 	if (!force && (global->red_quota > 0 || global->new_quota > 0))
 		return;
-	global->red_quota =  (tp->snd_cwnd * global->red_ratio) >> OLSCHED_SCALE;
-	global->new_quota = tp->snd_cwnd - global->red_quota;
+	global->red_quota =  (total_pkts * global->red_ratio) >> OLSCHED_SCALE;
+	global->new_quota = total_pkts - global->red_quota;
 	printk(KERN_INFO "ytxing: tp:%p use idx:%d red_quota:%u new_quota:%u ratio:%u/1024\n", tp, global->snd_idx, global->red_quota, global->new_quota, global->red_ratio >> 3);
 }
 
@@ -614,36 +619,45 @@ static void ol_exp3_update(struct sock *meta_sk)
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
 	struct ol_gambler_MAB *gambler = ol_cb->gambler;
-	u64 reward;
+	u64 reward, exp_reward;
 	u64 temp;
+	int i;
 
 	/* update arm weight and probability */
 	gambler->previous_arm_idx = gambler->current_arm_idx;
 
 	/* receive reward from the network */
 	reward = ol_calc_reward(meta_sk); // reward << OLSCHED_SCALE, actually. Since 0 < reward <= 1. 
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) reward:%u\n", meta_tp, reward >> 3);
 	reward *= OLSCHED_UNIT; /* arm_probability is in OLSCHED_UNIT, so expand the dividend */
 	do_div(reward, gambler->arm_probability[gambler->previous_arm_idx]);
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) reward:%u\n", meta_tp, reward >> 3);
 	// interval->arm_weight[interval->previous_arm_idx] update;
 	reward *= OLSCHED_GAMMA_MAB;
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) reward:%u\n", meta_tp, reward >> 3);
 	do_div(reward, OLSCHED_ARMS_NUM * OLSCHED_GAMMA_MAB_BASE);
 	
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) reward:%u ol_exp(reward):%u\n", meta_tp, reward >> 3, ol_exp(reward) >> 3);
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_weight[gambler->previous_arm_idx]:%u\n", meta_tp, gambler->arm_weight[gambler->previous_arm_idx] >> 3);
-	temp = gambler->arm_weight[gambler->previous_arm_idx] * ol_exp(reward);
-	gambler->arm_weight[gambler->previous_arm_idx] = temp >> OLSCHED_SCALE; /* reward << OLSCHED_SCALE, actually */
+	exp_reward = ol_exp(reward);
+	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) reward:%llu exp_reward:%llu\n", meta_tp, reward >> 3, exp_reward >> 3);
+	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_weight[%d]:%llu\n", meta_tp, gambler->previous_arm_idx, gambler->arm_weight[gambler->previous_arm_idx]);
+	temp = gambler->arm_weight[gambler->previous_arm_idx] * exp_reward;
+	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) temp:%llu\n", meta_tp, temp);
+	temp >>= OLSCHED_SCALE;
+	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) temp:%llu\n", meta_tp, temp);
+	while (temp > OLSCHED_MAX_WEIGHT){	
+		/********************************************\
+		 * in Exp3, arm_weight will exponential grow *
+		 * and all arm_weight needs to be shrinked   *
+		 * sometime.								 *
+		\********************************************/
+		for (i = 0; i < OLSCHED_ARMS_NUM; i++){
+			gambler->arm_weight[i] = max_t(u32, OLSCHED_UNIT, gambler->arm_weight[i] >> 8);
+			printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) shrink arm_weight[%dx]:%llu\n", meta_tp, i, gambler->arm_weight[i]);
+		}
+		temp = (gambler->arm_weight[gambler->previous_arm_idx] * ol_exp(reward)) >> OLSCHED_SCALE;
+	}
+	gambler->arm_weight[gambler->previous_arm_idx] = temp;
 
-	/********************************************\
-	 * in Exp3, arm_weight will exponential grow *
-	 * and all arm_weight needs to be shrinked   *
-	 * sometime.								 *
-	\********************************************/
 
 	/* Since arm_weight is stored in OLSCHED_UNIT, *= will multiply it to OLSCHED_UNIT^2 */
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_weight[gambler->previous_arm_idx]:%u\n", meta_tp, gambler->arm_weight[gambler->previous_arm_idx] >> 3);
+	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_weight[%d]:%llu\n", meta_tp, gambler->previous_arm_idx, gambler->arm_weight[gambler->previous_arm_idx]);
 
 	/* update the probility of previous arm accordingly */
 	ol_update_arm_probality(meta_sk);
@@ -656,7 +670,7 @@ bool ol_valid(struct olsched_priv *ol_p)
 }
 
 /* Updates the OL model of one sk */
-static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_ended)
+static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_started)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct sock *sk;
@@ -674,7 +688,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
 	u8 arm_idx;
 
-	*all_interval_ended = false;
+	*new_interval_started = false;
 
 	mptcp_for_each_sub(mpcb, mptcp) {
 		
@@ -721,7 +735,6 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 		return;
 	}
 
-	*all_interval_ended = true;
 	if (gambler == NULL)
 		return;
 	ol_exp3_update(meta_sk);
@@ -749,6 +762,8 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *all_interval_end
 		start_current_send_interval(tcp_sk(sk));
 	}
 	start_current_send_interval(tcp_sk(meta_sk));
+	
+	*new_interval_started = true;
 }
 
 
@@ -1095,11 +1110,11 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 	struct sock *sk, *unavailable_sk;
 	// int found = 0;
 	int i = 0;
-	bool all_interval_ended;
+	bool new_interval_started;
 
 	
 	/* process ol model immediately, since sending nothing doesn't mean receiving nothing */
-	ol_process_all_subflows(meta_sk, &all_interval_ended);
+	ol_process_all_subflows(meta_sk, &new_interval_started);
 	
 
 	/* As we set it, we have to reset it as well. */
@@ -1138,7 +1153,7 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 		ol_p = olsched_get_priv(tp);
 		olsched_correct_skb_pointers(meta_sk, ol_p);
 
-		olsched_check_quota(tp, ol_p, false); // ytxing
+		olsched_check_quota(tp, ol_p, new_interval_started); // ytxing: if new_interval_started, refresh the quota.
 		
 		if (ol_p->global_data->red_quota >= 1){ // Executing redundant routines
 			skb = olsched_next_skb_from_queue(&meta_sk->sk_write_queue,
@@ -1215,6 +1230,7 @@ static void olsched_init(struct sock *sk)
 	ol_p->global_data = kzalloc(sizeof(struct ol_global_MAB), GFP_KERNEL);
 
 	ol_p->global_data->red_ratio = OLSCHED_INIT_RED_RATIO;
+	ol_p->global_data->last_time_delivered = 12;
 	ol_p->global_data->state = OL_STAY;
 	ol_p->global_data->waiting = false;
 	ol_p->global_data->red_quota = 0;
