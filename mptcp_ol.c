@@ -111,9 +111,9 @@ struct ol_interval_MAB {
 
 	u32	interval_duration;
 
-	u8	snd_ended:1,
+	u8	snd_end_ready:1,
+		snd_ended:1,
 		rcv_ended:1,
-		invalid_utility:1,
 		init:1,
 		unusued:4;
 };
@@ -233,14 +233,15 @@ static int olsched_get_active_valid_sks_num(struct sock *meta_sk)
 static u64 olsched_get_bandwidth_interval(struct ol_interval_MAB *interval, struct tcp_sock *tp)
 {
 	u64 bandwidth;
-	u32 mss = tp->mss_cache;
-	u64 byte_rcv = (interval->delivered_end - interval->delivered_begin) * mss;
-	u64 duration = interval->rcv_time_end - interval->rcv_time_begin; 
+	// u32 mss = tp->mss_cache;
+	// u64 byte_rcv = (interval->delivered_end - interval->delivered_begin) * mss;
+	u64 byte_rcv = interval->snd_seq_end - interval->snd_seq_begin;
+	u64 duration = interval->rcv_time_end - interval->snd_time_begin; 
 	if (duration <= 0)
 		return 0;
-	if (byte_rcv == 0 && is_meta_tp(tp)){
-		byte_rcv = interval->snd_seq_end - interval->snd_seq_begin;
-	}
+	// if (byte_rcv == 0 && is_meta_tp(tp)){
+	// 	byte_rcv = interval->snd_seq_end - interval->snd_seq_begin;
+	// }
 	// printk(KERN_INFO "ytxing: tp:%p get bandwidth dl_bytes:%llu seq_bytes:%llu\n", tp, (interval->delivered_end - interval->delivered_begin) * mss, interval->snd_seq_end - interval->snd_seq_begin);
 	bandwidth = byte_rcv * USEC_PER_SEC;
 	do_div(bandwidth, duration); /* delivery rate, actually */
@@ -291,17 +292,16 @@ static void ol_setup_intervals_MAB(struct sock *sk, int arm_idx)
 /* Have we sent all the data we need to for this interval? Must have at least
  * the minimum number of packets and should have sent 1 RTT worth of data.
  */
-bool ol_current_send_interval_ended(struct ol_interval_MAB *interval, struct tcp_sock *tp)
+bool ol_current_send_interval_end_ready(struct ol_interval_MAB *interval, struct tcp_sock *tp)
 {
-	u32 packets_sent = tp->data_segs_out - interval->pkts_out_begin;
 	u32 interval_duration = interval->interval_duration;
 
 
 	/* not enough sending duration */
-	if (tp->tcp_mstamp - interval->snd_time_begin < interval_duration) 
+	if (tp->tcp_mstamp - interval->snd_time_begin < interval_duration) // TODO maybe timeout?
 		return false;
 
-	if (interval->snd_ended == true) 
+	if (interval->snd_end_ready == true)
 		return true;
 		
 	// /* not enough packets out and not timeout */
@@ -309,12 +309,7 @@ bool ol_current_send_interval_ended(struct ol_interval_MAB *interval, struct tcp
 	// 	return false;
 
 	/* end the sending state this interval */
-	interval->pkts_out_end = tp->data_segs_out; /* sure? maybe for non-sack */
-	interval->snd_seq_end = tp->snd_nxt;
-	interval->snd_time_end = tp->tcp_mstamp;
-	interval->snd_ended = true;
-	printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END packets_sent:%u bytes:%u\n", tp, is_meta_tp(tp), interval->index, packets_sent, interval->snd_seq_end - interval->snd_seq_begin);
-	printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END actual_duration:%llu interval_duration:%u\n", tp, is_meta_tp(tp), interval->index, interval->snd_time_end - interval->snd_time_begin, interval_duration);
+	interval->snd_end_ready = true;
 	return true;
 }
 
@@ -330,9 +325,24 @@ bool ol_all_subflow_send_interval_ended(struct tcp_sock *meta_tp)
 		struct tcp_sock *tp = mptcp->tp;
 		struct olsched_priv *ol_p = olsched_get_priv(tp);
 
-		all_ended = all_ended && ol_current_send_interval_ended(&ol_p->intervals_data[0], tp);
+		all_ended = all_ended && ol_current_send_interval_end_ready(&ol_p->intervals_data[0], tp);
 	}
 
+	if (all_ended){
+		mptcp_for_each_sub(mpcb, mptcp) {
+			struct tcp_sock *tp = mptcp->tp;
+			struct olsched_priv *ol_p = olsched_get_priv(tp);
+			struct ol_interval_MAB *interval = &ol_p->intervals_data[0];
+			u32 packets_sent = tp->data_segs_out - interval->pkts_out_begin;
+			u32 interval_duration = interval->interval_duration;
+
+			interval->snd_ended = true;
+			printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END packets_sent:%u bytes:%u\n", tp, is_meta_tp(tp), interval->index, packets_sent, interval->snd_seq_end - interval->snd_seq_begin);
+			printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END snd_duration:%llu interval_duration:%u\n", tp, is_meta_tp(tp), interval->index, interval->snd_time_end - interval->snd_time_begin, interval_duration);
+		}
+
+	}
+	
 	return all_ended;
 }
 
@@ -392,7 +402,8 @@ void start_current_send_interval(struct tcp_sock *tp)
 	} else {
 		interval = &olsched_get_cb(tp)->meta_interval[0];
 	}
-	interval->snd_time_begin = tp->tcp_mstamp;
+	// interval->snd_time_begin = tp->tcp_mstamp;
+	interval->snd_time_begin = 0; // mark a new interval
 	interval->snd_seq_begin = tp->snd_nxt;
 	interval->pkts_out_begin = tp->data_segs_out; /* maybe? */
 	interval->known_seq = interval->snd_seq_begin; /* init known_seq as the next unacked seq, should be less than snd_next*/
@@ -400,6 +411,7 @@ void start_current_send_interval(struct tcp_sock *tp)
 	interval->lost_begin = 0;
 
 	interval->snd_ended = false;
+	interval->snd_end_ready = false;
 	interval->rcv_ended = false;
 	if (is_meta_tp(tp)){
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) start interval snd_idx: %u\n", tp, interval->index);
@@ -447,13 +459,15 @@ u8 pull_the_arm_accordingly(struct sock *meta_sk)
 	struct ol_gambler_MAB *gambler = ol_cb->gambler;
 	// struct ol_global_MAB *global = ol_p->global_data;
 	int arm_idx;
+	u16 random, probability_cumulated, random_mask;
 
 	if (DEBUG_FIX_ARM){
 		gambler->current_arm_idx = arm_idx;
 		return DEBUG_FIXED_ARM_IDX;
 	}
 
-	u16 random = 555, probability_cumulated = 0, random_mask = OLSCHED_UNIT - 1;
+	probability_cumulated = 0; 
+	random_mask = OLSCHED_UNIT - 1;
 	get_random_bytes(&random, sizeof(random));
 	random = random & random_mask;
 	if (random > OLSCHED_UNIT)
@@ -495,10 +509,13 @@ static void update_interval_info_snd(struct ol_interval_MAB *interval, struct tc
 		return;
 	}
 
-	interval->snd_seq_end = tp->snd_nxt;
-
-	if(interval->snd_time_begin == 0)
+	if(interval->snd_time_begin == 0 && after(tp->snd_nxt, interval->snd_seq_begin))
 		interval->snd_time_begin = tp->tcp_mstamp;
+
+	/* end the sending state this interval */
+	interval->pkts_out_end = tp->data_segs_out; /* sure? maybe for non-sack */
+	interval->snd_seq_end = tp->snd_nxt;
+	interval->snd_time_end = tp->tcp_mstamp;
 
 	// printk(KERN_DEBUG "ytxing: tp:%p idx: %u snd_seq:%u->%u(%u)\n", tp, interval->index, interval->snd_seq_begin, interval->snd_seq_end, interval->snd_seq_end - interval->snd_seq_begin);
 }
@@ -540,7 +557,7 @@ static void update_interval_info_rcv(struct ol_interval_MAB *interval, struct tc
 		interval->rcv_time_end = tp->tcp_mstamp;
 		interval->rcv_ended = true;
 		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u lost:%u bytes:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3);
-		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->rcv_time_begin, olsched_get_bandwidth_interval(interval, tp));
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, olsched_get_bandwidth_interval(interval, tp));
 	}
 
 }
@@ -696,6 +713,9 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 	
 	struct mptcp_tcp_sock *mptcp;
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
+
+	u32 packets_sent;
+	u32 interval_duration;
 	u8 arm_idx;
 
 	*new_interval_started = false;
@@ -716,11 +736,9 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 		}
 		
 		/* SND INFO */
-		if (interval->snd_ended == false){
+		if (meta_interval->snd_ended == false){
 			update_interval_info_snd(interval, tp);
-			if (ol_current_send_interval_ended(interval, tp)){
-				global->waiting = true;
-			}
+			ol_current_send_interval_end_ready(interval, tp);
 		}
 
 		/* RCV INFO */
@@ -732,9 +750,18 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 	if (meta_interval->snd_ended == false){
 		update_interval_info_snd(meta_interval, meta_tp);
 		if (ol_all_subflow_send_interval_ended(meta_tp)){
-			if (!ol_current_send_interval_ended(meta_interval, meta_tp)){
+			if (!ol_current_send_interval_end_ready(meta_interval, meta_tp)){
 				printk(KERN_DEBUG "ytxing: meta_tp:%p BUG subflows snd end but not meta\n", meta_tp);
 			}
+			/* end the meta snd interval, same as in ol_all_subflow_send_interval_ended */
+			packets_sent = meta_tp->data_segs_out - meta_interval->pkts_out_begin;
+			interval_duration = meta_interval->interval_duration;
+
+			meta_interval->snd_ended = true;
+			printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END packets_sent:%u bytes:%u\n",\
+				meta_tp, is_meta_tp(meta_tp), meta_interval->index, packets_sent, meta_interval->snd_seq_end - meta_interval->snd_seq_begin);
+			printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END actual_duration:%llu interval_duration:%u\n",\
+				meta_tp, is_meta_tp(meta_tp), meta_interval->index, meta_interval->snd_time_end - meta_interval->snd_time_begin, interval_duration);
 		}
 	}
 	
