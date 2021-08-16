@@ -283,7 +283,14 @@ static void ol_setup_intervals_MAB(struct sock *sk, int arm_idx)
 		interval->red_ratio = ol_arm_to_red_ratio[arm_idx];
 	}
 	
-	global->last_time_delivered = interval->delivered_end - interval->delivered_begin;
+	if (interval->delivered_end <= interval->delivered_begin){
+		global->last_time_delivered = interval->delivered_end - interval->delivered_begin;
+	} else {
+		global->last_time_delivered = 0;
+	}
+
+	interval->interval_duration = max_t(u32, OLSCHED_INTERVALS_MIN_DURATION, (tp->srtt_us >> 3) * 3 / 2);
+
 	global->snd_idx = 0;
 	global->rcv_idx = 0;
 	global->waiting = false;
@@ -296,9 +303,11 @@ bool ol_current_send_interval_end_ready(struct ol_interval_MAB *interval, struct
 {
 	u32 interval_duration = interval->interval_duration;
 
+	if (interval->snd_time_begin == 0) // TODO maybe timeout?
+		return false;
 
 	/* not enough sending duration */
-	if (tp->tcp_mstamp - interval->snd_time_begin < interval_duration) // TODO maybe timeout?
+	if (interval->snd_time_end - interval->snd_time_begin < interval_duration) // TODO maybe timeout?
 		return false;
 
 	if (interval->snd_end_ready == true)
@@ -384,7 +393,11 @@ bool all_receive_interval_ended(struct sock *meta_sk)
 		all_ended = all_ended && receive_interval_ended(&ol_p->intervals_data[0]);
 	}
 
-	return all_ended && receive_interval_ended(meta_interval);;
+	/* if all subflows rcv ended, try to end meta interval */
+	if (all_ended)
+		all_ended = all_ended && receive_interval_ended(meta_interval);
+
+	return all_ended;
 }
 
 /* Set the red_ratio based on the currently-sending interval
@@ -404,7 +417,12 @@ void start_current_send_interval(struct tcp_sock *tp)
 	}
 	// interval->snd_time_begin = tp->tcp_mstamp;
 	interval->snd_time_begin = 0; // mark a new interval
+	interval->snd_time_end = 0; 
+	interval->rcv_time_begin = 0; // mark a new interval
+	interval->rcv_time_end = 0; // mark a new interval
+	
 	interval->snd_seq_begin = tp->snd_nxt;
+	// printk(KERN_DEBUG "ytxing: tp:%p start interval snd_seq_begin:%u tp->snd_nxt:%u\n", tp, interval->snd_seq_begin, tp->snd_nxt);
 	interval->pkts_out_begin = tp->data_segs_out; /* maybe? */
 	interval->known_seq = interval->snd_seq_begin; /* init known_seq as the next unacked seq, should be less than snd_next*/
 	interval->lost_bytes = 0;
@@ -512,6 +530,8 @@ static void update_interval_info_snd(struct ol_interval_MAB *interval, struct tc
 	if(interval->snd_time_begin == 0 && after(tp->snd_nxt, interval->snd_seq_begin))
 		interval->snd_time_begin = tp->tcp_mstamp;
 
+		
+	// printk(KERN_DEBUG "ytxing: tp:%p update_interval_info_snd snd_seq_begin:%u tp->snd_nxt:%u interval->snd_time_begin:%llu\n", tp, interval->snd_seq_begin, tp->snd_nxt, interval->snd_time_begin);
 	/* end the sending state this interval */
 	interval->pkts_out_end = tp->data_segs_out; /* sure? maybe for non-sack */
 	interval->snd_seq_end = tp->snd_nxt;
