@@ -31,14 +31,14 @@ typedef __s32 s32;
 typedef __s64 s64;
 
 #define DEBUG_FIX_ARM false
-#define DEBUG_FIXED_ARM_IDX 3
+#define DEBUG_FIXED_ARM_IDX 0
 
 #define OLSCHED_INTERVALS_NUM 1
 #define OLSCHED_INTERVALS_MIN_DURATION 100 * USEC_PER_MSEC /* minimal duration(us) */
+#define OLSCHED_INTERVALS_DURATION_N_RTT 5 /* minimal duration(us) */
 #define OLSCHED_INTERVALS_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 3
 #define OLSCHED_INTERVAL_MIN_PACKETS 30
 
-#define OLSCHED_ARMS_NUM 4
 #define OLSCHED_SAFE_MAX_WEIGHT 0x0000000fffffffff /* u32 */
 #define OLSCHED_GAME_ROUND 4
 #define OLSCHED_MIN_QUOTA 12
@@ -59,12 +59,13 @@ typedef __s64 s64;
 #define OLSCHED_GAMMA_MAB 20 /* div by OLSCHED_GAMMA_MAB_BASE */ 
 #define OLSCHED_GAMMA_MAB_BASE 100
 
-static const u16 ol_arm_to_red_ratio[OLSCHED_ARMS_NUM] = {
+static const u16 ol_arm_to_red_ratio[4] = {
 	OLSCHED_UNIT * 1,
 	OLSCHED_UNIT * 2 / 3,
 	OLSCHED_UNIT * 1 / 3,
 	OLSCHED_MIN_RED_RATIO
 };
+#define OLSCHED_ARMS_NUM sizeof(ol_arm_to_red_ratio)/sizeof(ol_arm_to_red_ratio[0])
 
 /* Scale factor for rate in pkt/uSec unit to avoid truncation in bandwidth
  * estimation. The rate unit ~= (1500 bytes / 1 usec / 2^24) ~= 715 bps.
@@ -289,7 +290,7 @@ static void ol_setup_intervals_MAB(struct sock *sk, int arm_idx)
 		global->last_time_delivered = 0;
 	}
 
-	interval->interval_duration = max_t(u32, OLSCHED_INTERVALS_MIN_DURATION, (tp->srtt_us >> 3) * 3 / 2);
+	interval->interval_duration = max_t(u32, OLSCHED_INTERVALS_MIN_DURATION, (tp->srtt_us >> 3) * OLSCHED_INTERVALS_DURATION_N_RTT);
 
 	global->snd_idx = 0;
 	global->rcv_idx = 0;
@@ -356,25 +357,22 @@ bool ol_all_subflow_send_interval_ended(struct tcp_sock *meta_tp)
 }
 
 
-/* Have we accounted for (acked or lost) enough of the packets that we sent to
- * calculate summary statistics?
- */
-bool receive_interval_ended(struct ol_interval_MAB *interval)
+bool is_receive_interval_ended(struct ol_interval_MAB *interval)
 {
-	if(interval->rcv_ended)
-		return true;
+	// if(interval->rcv_ended)
+	// 	return true;
 
-	if(interval->snd_ended && !before(interval->known_seq, interval->snd_seq_end)){
-		interval->rcv_ended = true;
-		return true;
-	}
+	// if(interval->snd_ended && !before(interval->known_seq, interval->snd_seq_end)){
+	// 	interval->rcv_ended = true;
+	// 	return true;
+	// }
 
-	return false;
+	// return false;
+	return interval->rcv_ended;
 }
 
-
 /* for MAB Solution, check if all intervals in each tp is ended */
-bool all_receive_interval_ended(struct sock *meta_sk)
+bool is_all_receive_interval_ended(struct sock *meta_sk)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);	
 	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
@@ -390,12 +388,12 @@ bool all_receive_interval_ended(struct sock *meta_sk)
 
 		/* TODO valid check, continue */
 
-		all_ended = all_ended && receive_interval_ended(&ol_p->intervals_data[0]);
+		all_ended = all_ended && is_receive_interval_ended(&ol_p->intervals_data[0]);
 	}
 
 	/* if all subflows rcv ended, try to end meta interval */
 	if (all_ended)
-		all_ended = all_ended && receive_interval_ended(meta_interval);
+		all_ended = all_ended && is_receive_interval_ended(meta_interval);
 
 	return all_ended;
 }
@@ -480,13 +478,14 @@ u8 pull_the_arm_accordingly(struct sock *meta_sk)
 	u16 random, probability_cumulated, random_mask;
 
 	if (DEBUG_FIX_ARM){
-		gambler->current_arm_idx = arm_idx;
+		gambler->current_arm_idx = DEBUG_FIXED_ARM_IDX;
 		return DEBUG_FIXED_ARM_IDX;
 	}
 
 	probability_cumulated = 0; 
 	random_mask = OLSCHED_UNIT - 1;
 	get_random_bytes(&random, sizeof(random));
+	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) random:%x random_mask:%x random:%x\n", meta_tp, random, random_mask, random & random_mask);
 	random = random & random_mask;
 	if (random > OLSCHED_UNIT)
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) BUG random > OLSCHED_UNIT\n", meta_tp);
@@ -600,7 +599,7 @@ static void olsched_check_quota(struct tcp_sock *tp,
 		return;
 	global->red_quota =  (total_pkts * global->red_ratio) >> OLSCHED_SCALE;
 	global->new_quota = total_pkts - global->red_quota;
-	printk(KERN_INFO "ytxing: tp:%p use idx:%d red_quota:%u new_quota:%u ratio:%u/1024\n", tp, global->snd_idx, global->red_quota, global->new_quota, global->red_ratio >> 3);
+	// printk(KERN_INFO "ytxing: tp:%p use idx:%d red_quota:%u new_quota:%u ratio:%u/1024\n", tp, global->snd_idx, global->red_quota, global->new_quota, global->red_ratio >> 3);
 }
 
 /* ytxing:
@@ -763,7 +762,6 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 
 		/* RCV INFO */
 		update_interval_info_rcv(interval, tp); // TODO update all subflow info
-		receive_interval_ended(interval);
 	}
 
 	/* SND INFO META */
@@ -787,7 +785,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 	
 	/* RCV INFO META */
 	update_interval_info_rcv(meta_interval, meta_tp);
-	if (!all_receive_interval_ended(meta_sk)){
+	if (!is_all_receive_interval_ended(meta_sk)){
 		/* if not all intervals finish, return and wait. */
 		return;
 	}
@@ -798,7 +796,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 	if (olsched_get_active_valid_sks_num(meta_sk) >= 2){
 		ol_exp3_update(meta_sk);
 	} else {
-		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) too few sks, do not update\n", meta_tp);
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) WTF too few sks, do not update\n", meta_tp);
 	}
 	
 
