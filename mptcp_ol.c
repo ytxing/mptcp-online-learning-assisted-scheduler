@@ -35,7 +35,7 @@ typedef __s64 s64;
 
 #define OLSCHED_INTERVALS_NUM 1
 #define OLSCHED_INTERVALS_MIN_DURATION 100 * USEC_PER_MSEC /* minimal duration(us) */
-#define OLSCHED_INTERVALS_DURATION_N_RTT 5 /* minimal duration(us) */
+#define OLSCHED_INTERVALS_DURATION_N_RTT 3/2 /* minimal duration(us) */
 #define OLSCHED_INTERVALS_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 3
 #define OLSCHED_INTERVAL_MIN_PACKETS 30
 
@@ -124,6 +124,13 @@ enum OL_GLOBAL_STATE {
 	OL_STAY, // another is playing game, I have to wait
 };
 
+/* it is to store the theoughput, loss rate and RTT fo a subflow in current "stable" condition */
+struct ol_monitor_MAB {
+	u64 avg_throughput;
+	u32 srtt;
+	u32 loss_rate;
+	u32 last_time_stable;
+};//或许可以记录一段时间内的arm weight distribution，如果分布明显改变可以认为它确实变了？或者子流monitor加分布同时看？
 
 struct ol_global_MAB {
 	u16	red_quota;	// ytxing: how many redundant pkts should this subflow send
@@ -151,8 +158,10 @@ struct ol_gambler_MAB {
 	u8 current_arm_idx;
 	u64 arm_weight[OLSCHED_ARMS_NUM];
 	u16 arm_probability[OLSCHED_ARMS_NUM];
-};
+	u32 curr_gamma;
 
+	u32 arm_count[OLSCHED_ARMS_NUM];
+};
 
 /* Struct to store the data of a single subflow */
 struct olsched_priv {
@@ -462,7 +471,7 @@ void ol_update_arm_probality(struct sock *meta_sk)
 		temp *= OLSCHED_GAMMA_MAB_BASE - OLSCHED_GAMMA_MAB;
 		temp /= OLSCHED_GAMMA_MAB_BASE;
 		gambler->arm_probability[i] = temp + gamma_over_K;
-		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_probability[%d]:%u/1024\n", meta_tp, i, gambler->arm_probability[i] >> 3);
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_probability[%d]:%u/1024 count:%u\n", meta_tp, i, gambler->arm_probability[i] >> 3, gambler->arm_count[i]);
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) temp:%llu gamma_over_K:%llu\n", meta_tp, temp >> 3, gamma_over_K >> 3);
 	}
 
@@ -497,6 +506,7 @@ u8 pull_the_arm_accordingly(struct sock *meta_sk)
 		}
 	}
 	gambler->current_arm_idx = arm_idx;
+	gambler->arm_count[arm_idx] ++;
 	return arm_idx;
 }
 
@@ -1323,9 +1333,12 @@ static void olsched_init(struct sock *sk)
 		
 		for (i = 0; i < OLSCHED_ARMS_NUM; i++){
 			ol_cb->gambler->arm_weight[i] = OLSCHED_UNIT;
+			ol_cb->gambler->arm_count[i] = 0;
 		}
+		ol_cb->gambler->curr_gamma = OLSCHED_GAMMA_MAB;
 		ol_update_arm_probality(mptcp_meta_sk(sk));
 		ol_cb->gambler->current_arm_idx = 0;
+		ol_cb->gambler->arm_count[0] ++;
 		printk(KERN_DEBUG "ytxing: olsched_init gambler meta_tp:%p\n", tcp_sk(mptcp_meta_sk(sk)));
 	}
 	
