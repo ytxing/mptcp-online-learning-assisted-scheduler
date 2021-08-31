@@ -729,13 +729,14 @@ static bool ol_monitor_update_and_change_check(struct sock *meta_sk)
 	struct ol_monitor_MAB *monitor;
 	struct mptcp_tcp_sock *mptcp;
 	u64 subflow_throughput;
+	bool thp_flag = false, loss_flag = false, rtt_flag = false;
 	bool significant_change = false;
 
 	mptcp_for_each_sub(mpcb, mptcp) {
 		struct sock *sk = mptcp_to_sock(mptcp);		
 		struct tcp_sock *tp = mptcp->tp;
 		struct olsched_priv *ol_p;
-		u32 curr_loss_rate;
+		s64 curr_loss_rate, prev_loss_rate;
 
 		if (!subflow_is_active(tp) || mptcp_is_def_unavailable(sk)) /* we ignore unavailable subflows*/
 			continue;
@@ -743,26 +744,34 @@ static bool ol_monitor_update_and_change_check(struct sock *meta_sk)
 		ol_p = olsched_get_priv(tp);
 		interval = &ol_p->intervals_data[0];
 		monitor = ol_p->global_data->monitor;
-		subflow_throughput = olsched_get_bandwidth_interval(interval, tp) << 3;
+		subflow_throughput = olsched_get_bandwidth_interval(interval, tp);
 		// subflow_throughput <= monitor->avg_throughput / 2, regard it as a nerwork change
 		if (monitor->avg_throughput == 0)
 			monitor->avg_throughput = subflow_throughput;
 		if (subflow_throughput <= monitor->avg_throughput >> 1){
 			significant_change = true;
+			thp_flag = true;
 		}
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) MNT thp_flag:%d monitor->avg_throughput:%llu subflow_throughput:%llu\n", tp, is_meta_tp(tp), thp_flag, monitor->avg_throughput, subflow_throughput);
 		monitor->avg_throughput = monitor->avg_throughput - (monitor->avg_throughput >> 3) + (subflow_throughput >> 3); // 0.875old + 0.125new
 		// tp->srtt_us ?? monitor->srtt
 		if (monitor->srtt == 0)
 			monitor->srtt = tp->srtt_us;
 		if (monitor->srtt > tp->srtt_us * 9 / 8){ //not sure about that
 			significant_change = true;
+			rtt_flag = true;
 		}
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) MNT rtt_flag:%d monitor->srtt:%u tp->srtt_us:%u\n", tp, is_meta_tp(tp), rtt_flag, monitor->srtt, tp->srtt_us);
 		monitor->srtt = tp->srtt_us; // since tp->srtt_us has already smoothed. Note that next update will be several rtt away.
 		// ?? monitor->lost_rate
 		curr_loss_rate = olsched_get_loss_rate(interval);
-		if (monitor->loss_rate > curr_loss_rate - 5 * OLSCHED_UNIT / 100 || monitor->loss_rate < curr_loss_rate + 5 * OLSCHED_UNIT / 100){ // 0.03 or less?
+		prev_loss_rate = monitor->loss_rate;
+		if (abs(curr_loss_rate - prev_loss_rate) > (5 * OLSCHED_UNIT / 100)){ // 0.05 or less?
 			significant_change = true;
+			loss_flag = true;
 		}
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) MNT abs(curr_loss_rate - prev_loss_rate):%d\n", tp, is_meta_tp(tp), abs(curr_loss_rate - prev_loss_rate));
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) MNT loss_flag:%d prev_loss_rate:%llu curr_loss_rate:%llu\n", tp, is_meta_tp(tp), loss_flag, prev_loss_rate >> 3, curr_loss_rate >> 3);
 		monitor->loss_rate = curr_loss_rate;
 	}
 	return significant_change;
