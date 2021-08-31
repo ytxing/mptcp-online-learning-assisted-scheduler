@@ -721,6 +721,7 @@ static void ol_exp3_update(struct sock *meta_sk)
 	ol_update_arm_probality(meta_sk);
 }
 
+/* TODO 这里检测到change之后，gamma值应该变大（多大）一段时间（多长）。 */
 static bool ol_monitor_update_and_change_check(struct sock *meta_sk)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
