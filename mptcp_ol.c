@@ -119,8 +119,8 @@ struct ol_interval_MAB {
 		unusued:4;
 };
 
-enum OL_GLOBAL_STATE {
-	OL_PULL, // this tp is playing MAB game
+enum OL_MONITOR_STATE {
+	OL_CHANGE, // this tp is playing MAB game
 	OL_STAY, // another is playing game, I have to wait
 };
 
@@ -129,7 +129,8 @@ struct ol_monitor_MAB {
 	u64 avg_throughput;
 	u32 srtt;
 	u32 loss_rate;
-	u32 last_time_stable;
+	u32 change_time;
+	enum OL_MONITOR_STATE state;
 	u16 count;
 };//或许可以记录一段时间内的arm weight distribution，如果分布明显改变可以认为它确实变了？或者子流monitor加分布同时看？
 
@@ -149,8 +150,7 @@ struct ol_global_MAB {
 		first_move:1,
 		init:1,
 		unused:4; 
-
-	enum OL_GLOBAL_STATE state;	
+	
 	
 	struct ol_monitor_MAB *monitor;
 };
@@ -315,11 +315,11 @@ bool ol_current_send_interval_end_ready(struct ol_interval_MAB *interval, struct
 {
 	u32 interval_duration = interval->interval_duration;
 
-	if (interval->snd_time_begin == 0) // TODO maybe timeout?
+	if (interval->snd_time_begin == 0)
 		return false;
 
 	/* not enough sending duration */
-	if (interval->snd_time_end - interval->snd_time_begin < interval_duration) // TODO maybe timeout?
+	if (interval->snd_time_end - interval->snd_time_begin < interval_duration)
 		return false;
 
 	if (interval->snd_end_ready == true)
@@ -396,8 +396,6 @@ bool is_all_receive_interval_ended(struct sock *meta_sk)
 	mptcp_for_each_sub(mpcb, mptcp) {	
 		struct tcp_sock *tp = mptcp->tp;
 		struct olsched_priv *ol_p = olsched_get_priv(tp);
-
-		/* TODO valid check, continue */
 
 		all_ended = all_ended && is_receive_interval_ended(&ol_p->intervals_data[0]);
 	}
@@ -727,17 +725,19 @@ static bool ol_monitor_update_and_change_check(struct sock *meta_sk)
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
 	struct ol_interval_MAB *interval;
+	struct ol_global_MAB *global;
 	struct ol_monitor_MAB *monitor;
 	struct mptcp_tcp_sock *mptcp;
 	u64 subflow_throughput;
-	bool thp_flag = false, loss_flag = false, rtt_flag = false;
-	bool significant_change = false;
 
 	mptcp_for_each_sub(mpcb, mptcp) {
 		struct sock *sk = mptcp_to_sock(mptcp);		
 		struct tcp_sock *tp = mptcp->tp;
 		struct olsched_priv *ol_p;
 		s64 curr_loss_rate, prev_loss_rate;
+		bool significant_change = false;
+		bool thp_flag = false, loss_flag = false, rtt_flag = false;
+		bool tune_gamma = false;
 
 		if (!subflow_is_active(tp) || mptcp_is_def_unavailable(sk)) /* we ignore unavailable subflows*/
 			continue;
@@ -774,8 +774,13 @@ static bool ol_monitor_update_and_change_check(struct sock *meta_sk)
 		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) MNT abs(curr_loss_rate - prev_loss_rate):%d\n", tp, is_meta_tp(tp), abs(curr_loss_rate - prev_loss_rate));
 		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) MNT loss_flag:%d prev_loss_rate:%llu curr_loss_rate:%llu\n", tp, is_meta_tp(tp), loss_flag, prev_loss_rate >> 3, curr_loss_rate >> 3);
 		monitor->loss_rate = curr_loss_rate;
+		if (significant_change){
+			monitor->state = OL_CHANGE;
+			monitor->change_time = tp->tcp_mstamp;
+			tune_gamma = true;
+		}
 	}
-	return significant_change;
+	return tune_gamma;
 }
 
 /* was the ol struct fully inited */
@@ -832,7 +837,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 		}
 
 		/* RCV INFO */
-		update_interval_info_rcv(interval, tp); // TODO update all subflow info
+		update_interval_info_rcv(interval, tp);
 	}
 
 	/* SND INFO META */
@@ -890,7 +895,6 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 			continue;
 		}
 		ol_setup_intervals_MAB(sk, arm_idx);
-		global->state = OL_PULL;
 
 		start_current_send_interval(tcp_sk(sk));
 	}
@@ -1374,7 +1378,7 @@ static void olsched_init(struct sock *sk)
 
 	ol_p->global_data->red_ratio = OLSCHED_INIT_RED_RATIO;
 	ol_p->global_data->last_time_delivered = OLSCHED_MIN_QUOTA;
-	ol_p->global_data->state = OL_STAY;
+	ol_p->global_data->monitor->state = OL_CHANGE;
 	ol_p->global_data->waiting = false;
 	ol_p->global_data->red_quota = 0;
 	ol_p->global_data->new_quota = 0;
@@ -1382,7 +1386,7 @@ static void olsched_init(struct sock *sk)
 	ol_p->global_data->monitor->avg_throughput = 0;
 	ol_p->global_data->monitor->loss_rate = 0;
 	ol_p->global_data->monitor->srtt = 0;
-	ol_p->global_data->monitor->last_time_stable = 0;
+	ol_p->global_data->monitor->change_time = 0;
 	ol_p->global_data->monitor->count = 0;
 
 	if (!ol_cb->meta_interval){
