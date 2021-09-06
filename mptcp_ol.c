@@ -37,6 +37,7 @@ typedef __s64 s64;
 #define OLSCHED_INTERVALS_MIN_DURATION 100 * USEC_PER_MSEC /* minimal duration(us) */
 #define OLSCHED_INTERVALS_DURATION_N_RTT 3/2 /* minimal duration(us) */
 #define OLSCHED_INTERVALS_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 3
+#define OLSCHED_DCP_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 10 /* a timeout for decoupled bandwidth */
 #define OLSCHED_INTERVAL_MIN_PACKETS 30
 
 #define OLSCHED_SAFE_MAX_WEIGHT 0x0000000fffffffff /* u32 */
@@ -135,7 +136,10 @@ struct ol_global {
 	u16	new_quota;	// ytxing: how many new pkts should this subflow send
 	u16	red_ratio;	// ytxing: the ratio to calculate current quota, the same as the red_ratio current interval >> OLSCHED_SCALE
 
-	u32 last_time_delivered; /* pkts */
+	u32 last_time_delivered; /* pkts, for quota calculation */
+
+	u64 decoupled_bandwdith; /* average bandwidth estimated in "redundant intervals" */
+	u64	bwd_update_time;
 
 	/* intervals info */
 	u8	snd_idx:4, 	// ytxing: the interval index currently sending pkts (< OLSCHED_INTERVALS_NUM)
@@ -156,10 +160,12 @@ struct ol_gambler {
 	u32 curr_gamma;
 
 	u32 arm_count[OLSCHED_ARMS_NUM];
+	u8	force_decoupled:1,
+		unused:7;
 };
 
 /* Struct to store the data of a single subflow */
-struct olsched_priv {
+struct ol_priv {
 	/* The skb or NULL */
 	struct sk_buff *skb;
 	/* End sequence number of the skb. This number should be checked
@@ -175,7 +181,7 @@ struct olsched_priv {
 };
 
 /* Struct to store the data of the control block */
-struct olsched_cb {
+struct ol_cb {
 	/* The next subflow where a skb should be sent or NULL */
 	struct tcp_sock *next_subflow;
 	struct ol_interval *meta_interval;
@@ -184,15 +190,15 @@ struct olsched_cb {
 };
 
 /* Returns the socket data from a given subflow socket */
-static struct olsched_priv *olsched_get_priv(struct tcp_sock *tp)
+static struct ol_priv *ol_get_priv(struct tcp_sock *tp)
 {
-	return (struct olsched_priv *)&tp->mptcp->mptcp_sched[0];
+	return (struct ol_priv *)&tp->mptcp->mptcp_sched[0];
 }
 
 /* Returns the control block data from a given meta socket */
-static struct olsched_cb *olsched_get_cb(struct tcp_sock *tp)
+static struct ol_cb *ol_get_cb(struct tcp_sock *tp)
 {
-	return (struct olsched_cb *)&tp->mpcb->mptcp_sched[0];
+	return (struct ol_cb *)&tp->mpcb->mptcp_sched[0];
 }
 
 /* get x = number * OLSCHED_UNIT, return (e^number)*OLSCHED_UNIT */
@@ -212,7 +218,7 @@ static u32 ol_exp(u32 x)
 }
 
 
-static int olsched_get_active_valid_sks_num(struct sock *meta_sk)
+static int ol_get_active_valid_sks_num(struct sock *meta_sk)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
@@ -236,7 +242,7 @@ static int olsched_get_active_valid_sks_num(struct sock *meta_sk)
  *			2. bandwidth = delivered_byte / time_interval
  *			in Bps
  */
-static u64 olsched_get_bandwidth_interval(struct ol_interval *interval, struct tcp_sock *tp)
+static u64 ol_get_bandwidth_interval(struct ol_interval *interval, struct tcp_sock *tp)
 {
 	u64 bandwidth;
 	// u32 mss = tp->mss_cache;
@@ -254,11 +260,30 @@ static u64 olsched_get_bandwidth_interval(struct ol_interval *interval, struct t
 	return bandwidth; /* Bps */
 }
 
+/* ytxing:	update max bandwidth, e.g., the bandwidth estimated in "redundant interval" (arm_idx = 0)
+ */
+static void ol_update_decoupled_bandwidth_interval(struct ol_gambler *gambler, struct ol_interval *interval, struct tcp_sock *tp)
+{
+	struct ol_priv *ol_p = ol_get_priv(tp);
+	u64 curr_bandwidth = ol_get_bandwidth_interval(interval, tp);
+
+	if (gambler->previous_arm_idx != 0){
+		if (after(tp->tcp_mstamp, ol_p->global_data->bwd_update_time + OLSCHED_DCP_BWD_TIMEOUT)){
+			gambler->force_decoupled = true;
+		}
+		return;
+	}
+
+	ol_p->global_data->decoupled_bandwdith = curr_bandwidth;
+	ol_p->global_data->bwd_update_time = tp->tcp_mstamp;
+}
+
+
 /* ytxing:	
  * get the loss rate of the sk, make sure this interval is COMPLETED		
  * in (0, 1) << OLSCHED_SCALE
  */
-static u64 olsched_get_loss_rate(struct ol_interval *interval)
+static u64 ol_get_loss_rate(struct ol_interval *interval)
 {
 	u64 loss_rate;
 	u32 delivered;
@@ -278,7 +303,7 @@ static u64 olsched_get_loss_rate(struct ol_interval *interval)
 static void ol_setup_intervals_MAB(struct sock *sk, int arm_idx)
 {	
 	struct tcp_sock *tp = tcp_sk(sk);
-	struct olsched_priv *ol_p = olsched_get_priv(tp);
+	struct ol_priv *ol_p = ol_get_priv(tp);
 	struct ol_global *global = ol_p->global_data;
 	struct ol_interval *interval = &ol_p->intervals_data[0];
 	if (!ol_p || !global || !interval){
@@ -332,13 +357,13 @@ bool ol_current_send_interval_end_ready(struct ol_interval *interval, struct tcp
 bool ol_all_subflow_send_interval_ended(struct tcp_sock *meta_tp)
 {
 	struct mptcp_tcp_sock *mptcp;
-	// struct ol_global *global = olsched_get_cb(meta_tp);
+	// struct ol_global *global = ol_get_cb(meta_tp);
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
 	bool all_ended = true;
 
 	mptcp_for_each_sub(mpcb, mptcp) {
 		struct tcp_sock *tp = mptcp->tp;
-		struct olsched_priv *ol_p = olsched_get_priv(tp);
+		struct ol_priv *ol_p = ol_get_priv(tp);
 
 		all_ended = all_ended && ol_current_send_interval_end_ready(&ol_p->intervals_data[0], tp);
 	}
@@ -346,7 +371,7 @@ bool ol_all_subflow_send_interval_ended(struct tcp_sock *meta_tp)
 	if (all_ended){
 		mptcp_for_each_sub(mpcb, mptcp) {
 			struct tcp_sock *tp = mptcp->tp;
-			struct olsched_priv *ol_p = olsched_get_priv(tp);
+			struct ol_priv *ol_p = ol_get_priv(tp);
 			struct ol_interval *interval = &ol_p->intervals_data[0];
 			u32 packets_sent = tp->data_segs_out - interval->pkts_out_begin;
 			u32 interval_duration = interval->interval_duration;
@@ -380,16 +405,16 @@ bool is_receive_interval_ended(struct ol_interval *interval)
 bool is_all_receive_interval_ended(struct sock *meta_sk)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);	
-	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 	struct ol_interval *meta_interval = &ol_cb->meta_interval[0];
 	struct mptcp_tcp_sock *mptcp;
-	// struct ol_global *global = olsched_get_cb(meta_tp);
+	// struct ol_global *global = ol_get_cb(meta_tp);
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
 	bool all_ended = true;
 
 	mptcp_for_each_sub(mpcb, mptcp) {	
 		struct tcp_sock *tp = mptcp->tp;
-		struct olsched_priv *ol_p = olsched_get_priv(tp);
+		struct ol_priv *ol_p = ol_get_priv(tp);
 
 		all_ended = all_ended && is_receive_interval_ended(&ol_p->intervals_data[0]);
 	}
@@ -406,15 +431,15 @@ bool is_all_receive_interval_ended(struct sock *meta_sk)
  */
 void start_current_send_interval(struct tcp_sock *tp)
 {
-	struct olsched_priv *ol_p;
+	struct ol_priv *ol_p;
 	struct ol_global *global;
 	struct ol_interval *interval;
 	if (!is_meta_tp(tp)){
-		ol_p = olsched_get_priv(tp);
+		ol_p = ol_get_priv(tp);
 		global = ol_p->global_data;
 		interval = &ol_p->intervals_data[0];
 	} else {
-		interval = &olsched_get_cb(tp)->meta_interval[0];
+		interval = &ol_get_cb(tp)->meta_interval[0];
 	}
 	// interval->snd_time_begin = tp->tcp_mstamp;
 	interval->snd_time_begin = 0; // mark a new interval
@@ -447,7 +472,7 @@ void start_current_send_interval(struct tcp_sock *tp)
 void ol_update_arm_probality(struct sock *meta_sk)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
-	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 	struct ol_gambler *gambler = ol_cb->gambler;
 
 	// struct ol_global *global = ol_p->global_data;
@@ -474,7 +499,7 @@ void ol_update_arm_probality(struct sock *meta_sk)
 u8 pull_the_arm_accordingly(struct sock *meta_sk)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
-	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 	struct ol_gambler *gambler = ol_cb->gambler;
 	// struct ol_global *global = ol_p->global_data;
 	int arm_idx;
@@ -483,6 +508,13 @@ u8 pull_the_arm_accordingly(struct sock *meta_sk)
 	if (DEBUG_FIX_ARM){
 		gambler->current_arm_idx = DEBUG_FIXED_ARM_IDX;
 		return DEBUG_FIXED_ARM_IDX;
+	}
+
+	/* if we need to decouple subflows to estimate bandwidth of them */
+	if (gambler->force_decoupled){
+		gambler->force_decoupled = false;
+		gambler->current_arm_idx = 0;
+		return 0;
 	}
 
 	probability_cumulated = 0; 
@@ -507,7 +539,7 @@ u8 pull_the_arm_accordingly(struct sock *meta_sk)
 u8 pull_the_arm_with_hi_probability(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
-	struct olsched_cb *ol_cb = olsched_get_cb(tp);
+	struct ol_cb *ol_cb = ol_get_cb(tp);
 	struct ol_gambler *gambler = ol_cb->gambler;
 	// struct ol_global *global = ol_p->global_data;
 	int arm_idx, hi_arm_idx;
@@ -550,7 +582,7 @@ static void update_all_subflow_interval_info_snd(struct tcp_sock *meta_tp)
 
 	mptcp_for_each_sub(mpcb, mptcp) {	
 		struct tcp_sock *tp = mptcp->tp;
-		struct olsched_priv *ol_p = olsched_get_priv(tp);
+		struct ol_priv *ol_p = ol_get_priv(tp);
 
 		update_interval_info_snd(&ol_p->intervals_data[0], tp);
 	}
@@ -563,7 +595,7 @@ static void update_all_subflow_interval_info_snd(struct tcp_sock *meta_tp)
  */
 static void update_interval_info_rcv(struct ol_interval *interval, struct tcp_sock *tp)
 {
-	// struct olsched_priv *ol_p = olsched_get_priv(tp);
+	// struct ol_priv *ol_p = ol_get_priv(tp);
 	
 	u32 current_interval_known_seq = interval->known_seq;
 	interval->known_seq = tp->snd_una;
@@ -580,7 +612,7 @@ static void update_interval_info_rcv(struct ol_interval *interval, struct tcp_so
 		interval->rcv_time_end = tp->tcp_mstamp;
 		interval->rcv_ended = true;
 		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u lost:%u bytes:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3);
-		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, olsched_get_bandwidth_interval(interval, tp));
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
 		return;
 	}
 	/* ytxing: something wrong here */
@@ -590,7 +622,7 @@ static void update_interval_info_rcv(struct ol_interval *interval, struct tcp_so
 		interval->rcv_time_end = tp->tcp_mstamp;
 		interval->rcv_ended = true;
 		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u WTF RCV END delivered:%u lost:%u bytes:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3);
-		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u WTF RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, olsched_get_bandwidth_interval(interval, tp));
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u WTF RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
 		return;
 	}
 
@@ -601,8 +633,8 @@ static void update_interval_info_rcv(struct ol_interval *interval, struct tcp_so
  * e.g., how many redundant should it send.
  * force means we go to another interval and refresh the quota accordingly.
  */
-static void olsched_check_quota(struct tcp_sock *tp,
-					  struct olsched_priv *ol_p, bool force)
+static void ol_check_quota(struct tcp_sock *tp,
+					  struct ol_priv *ol_p, bool force)
 {
 	struct ol_global *global = ol_p->global_data;
 	u32 total_pkts = max_t(u32, OLSCHED_MIN_QUOTA, global->last_time_delivered);
@@ -625,7 +657,8 @@ static void olsched_check_quota(struct tcp_sock *tp,
  */
 static u64 ol_calc_reward(struct sock *meta_sk) {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
-	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
+	struct ol_gambler *gambler = ol_cb->gambler;
 	struct ol_interval *meta_interval = ol_cb->meta_interval;
 	struct ol_interval *interval;
 	struct mptcp_tcp_sock *mptcp;
@@ -635,7 +668,7 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 	u64 reward;
 
 
-	meta_throughput = olsched_get_bandwidth_interval(meta_interval, meta_tp);
+	meta_throughput = ol_get_bandwidth_interval(meta_interval, meta_tp);
 	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) calc reward meta_throughput:%llu\n", meta_tp, meta_throughput);
 
 
@@ -645,14 +678,22 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 	mptcp_for_each_sub(mpcb, mptcp) {
 		struct sock *sk = mptcp_to_sock(mptcp);		
 		struct tcp_sock *tp = mptcp->tp;
-		struct olsched_priv *ol_p;
+		struct ol_priv *ol_p;
 
 		if (!subflow_is_active(tp) || mptcp_is_def_unavailable(sk)) /* we ignore unavailable subflows*/
 			continue;
 
-		ol_p = olsched_get_priv(tp);
+		ol_p = ol_get_priv(tp);
 		interval = &ol_p->intervals_data[0];
-		subflow_throughput_sum += olsched_get_bandwidth_interval(interval, tp);
+
+		ol_update_decoupled_bandwidth_interval(gambler, interval, tp);
+
+		if (ol_p->global_data->decoupled_bandwdith == 0){
+			subflow_throughput_sum += ol_get_bandwidth_interval(interval, tp);
+		}
+		else {
+			subflow_throughput_sum += ol_p->global_data->decoupled_bandwdith;
+		}
 	}
 	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) calc reward subflow_throughput_sum:%llu\n", meta_tp, subflow_throughput_sum);
 
@@ -694,7 +735,7 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 static void ol_exp3_update(struct sock *meta_sk)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
-	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 	struct ol_gambler *gambler = ol_cb->gambler;
 	struct ol_monitor *monitor = ol_cb->monitor;
 	u64 reward, exp_reward;
@@ -745,7 +786,7 @@ static void ol_exp3_update(struct sock *meta_sk)
 }
 
 /* was the ol struct fully inited */
-bool ol_valid(struct olsched_priv *ol_p)
+bool ol_valid(struct ol_priv *ol_p)
 {	
 	return (ol_p && ol_p->global_data && ol_p->intervals_data && ol_p->intervals_data[0].init && ol_p->global_data->init);
 }
@@ -756,11 +797,11 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct sock *sk;
 	struct tcp_sock *tp;
-	// struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	// struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 
-	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 	struct ol_interval *meta_interval = &ol_cb->meta_interval[0];
-	struct olsched_priv *ol_p;
+	struct ol_priv *ol_p;
 	struct ol_global *global;
 	struct ol_gambler *gambler = ol_cb->gambler;
 	struct ol_interval *interval; // ytxing: snd_idx should always be 0 with MAB
@@ -780,7 +821,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 		
 		sk = mptcp_to_sock(mptcp);
 		tp = tcp_sk(sk);
-		ol_p = olsched_get_priv(tp);
+		ol_p = ol_get_priv(tp);
 		interval = &ol_p->intervals_data[0];
 		global = ol_p->global_data;
 
@@ -831,7 +872,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 	if (gambler == NULL)
 		return;
 
-	if (olsched_get_active_valid_sks_num(meta_sk) >= 2){
+	if (ol_get_active_valid_sks_num(meta_sk) >= 2){
 		ol_exp3_update(meta_sk);
 	} else {
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) WTF too few sks, do not update\n", meta_tp);
@@ -847,7 +888,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 	mptcp_for_each_sub(mpcb, mptcp) {
 		// printk(KERN_DEBUG "ytxing: tp:%p PROCESS\n", mptcp->tp);
 		sk = mptcp_to_sock(mptcp);
-		ol_p = olsched_get_priv(tcp_sk(sk));
+		ol_p = ol_get_priv(tcp_sk(sk));
 		global = ol_p->global_data;
 
 		if (mptcp_is_def_unavailable(sk)){
@@ -867,7 +908,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 
 
 
-static bool olsched_use_subflow(struct sock *meta_sk,
+static bool ol_use_subflow(struct sock *meta_sk,
 				 int active_valid_sks,
 				 struct tcp_sock *tp,
 				 struct sk_buff *skb)
@@ -880,7 +921,7 @@ static bool olsched_use_subflow(struct sock *meta_sk,
 
 	if (TCP_SKB_CB(skb)->path_mask == 0) {
 		if (active_valid_sks == -1)
-			active_valid_sks = olsched_get_active_valid_sks_num(meta_sk);
+			active_valid_sks = ol_get_active_valid_sks_num(meta_sk);
 
 		if (subflow_is_backup(tp) && active_valid_sks > 0)
 			return false;
@@ -895,8 +936,8 @@ static bool olsched_use_subflow(struct sock *meta_sk,
 	hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(			\
 		&(__mptcp)->node)), struct mptcp_tcp_sock, node)
 
-static void olsched_update_next_subflow(struct tcp_sock *tp,
-					 struct olsched_cb *ol_cb)
+static void ol_update_next_subflow(struct tcp_sock *tp,
+					 struct ol_cb *ol_cb)
 {
 	struct mptcp_tcp_sock *mptcp = mptcp_entry_next_rcu(tp->mptcp);
 
@@ -912,7 +953,7 @@ static struct sock *ol_get_available_subflow(struct sock *meta_sk,
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
-	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 	struct tcp_sock *first_tp = ol_cb->next_subflow, *tp;
 	struct mptcp_tcp_sock *mptcp;
 	int found = 0;
@@ -960,7 +1001,7 @@ static struct sock *ol_get_available_subflow(struct sock *meta_sk,
 
 		if (mptcp_is_available((struct sock *)tp, skb,
 				       zero_wnd_test)) {
-			olsched_update_next_subflow(tp, ol_cb);
+			ol_update_next_subflow(tp, ol_cb);
 			return (struct sock *)tp;
 		}
 	}
@@ -973,7 +1014,7 @@ static struct sock *ol_get_available_subflow(struct sock *meta_sk,
 
 		if (mptcp_is_available((struct sock *)tp, skb,
 				       zero_wnd_test)) {
-			olsched_update_next_subflow(tp, ol_cb);
+			ol_update_next_subflow(tp, ol_cb);
 			return (struct sock *)tp;
 		}
 	}
@@ -983,8 +1024,8 @@ static struct sock *ol_get_available_subflow(struct sock *meta_sk,
 }
 
 /* Corrects the stored skb pointers if they are invalid */
-static void olsched_correct_skb_pointers(struct sock *meta_sk,
-					  struct olsched_priv *ol_p)
+static void ol_correct_skb_pointers(struct sock *meta_sk,
+					  struct ol_priv *ol_p)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 
@@ -1038,7 +1079,7 @@ static struct sock *get_shorter_rtt_subflow_with_selector(struct mptcp_cb *mpcb,
 
 
 /* Returns the next skb from the queue */
-static struct sk_buff *olsched_next_skb_from_queue(struct sk_buff_head *queue,
+static struct sk_buff *ol_next_skb_from_queue(struct sk_buff_head *queue,
 						    struct sk_buff *previous,
 						    struct sock *meta_sk)
 {
@@ -1082,7 +1123,7 @@ static struct sk_buff *mptcp_ol_next_segment(struct sock *meta_sk,
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
-	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
+	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 	struct tcp_sock *first_tp = ol_cb->next_subflow, *tp;
 	struct mptcp_tcp_sock *mptcp;
 	int active_valid_sks = -1;
@@ -1122,7 +1163,7 @@ static struct sk_buff *mptcp_ol_next_segment(struct sock *meta_sk,
 	tp = first_tp;
 
 	*reinject = 0;
-	active_valid_sks = olsched_get_active_valid_sks_num(meta_sk);
+	active_valid_sks = ol_get_active_valid_sks_num(meta_sk);
 
 	/* We want to pick a subflow that is after 'first_tp' in the list of subflows.
 	 * Thus, the first mptcp_for_each_sub()-loop tries to walk the list up
@@ -1132,7 +1173,7 @@ static struct sk_buff *mptcp_ol_next_segment(struct sock *meta_sk,
 	 * beginning of the list up to 'first_tp'.
 	 */
 	mptcp_for_each_sub(mpcb, mptcp) {
-		struct olsched_priv *ol_p;
+		struct ol_priv *ol_p;
 
 		if (tp == mptcp->tp)
 			found = 1;
@@ -1143,16 +1184,16 @@ static struct sk_buff *mptcp_ol_next_segment(struct sock *meta_sk,
 		tp = mptcp->tp;
 
 		/* Correct the skb pointers of the current subflow */
-		ol_p = olsched_get_priv(tp);
-		olsched_correct_skb_pointers(meta_sk, ol_p);
+		ol_p = ol_get_priv(tp);
+		ol_correct_skb_pointers(meta_sk, ol_p);
 
-		skb = olsched_next_skb_from_queue(&meta_sk->sk_write_queue,
+		skb = ol_next_skb_from_queue(&meta_sk->sk_write_queue,
 						   ol_p->skb, meta_sk);
-		if (skb && olsched_use_subflow(meta_sk, active_valid_sks, tp,
+		if (skb && ol_use_subflow(meta_sk, active_valid_sks, tp,
 						skb)) {
 			ol_p->skb = skb;
 			ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
-			olsched_update_next_subflow(tp, ol_cb);
+			ol_update_next_subflow(tp, ol_cb);
 			*subsk = (struct sock *)tp;
 
 			if (TCP_SKB_CB(skb)->path_mask)
@@ -1162,7 +1203,7 @@ static struct sk_buff *mptcp_ol_next_segment(struct sock *meta_sk,
 	}
 
 	mptcp_for_each_sub(mpcb, mptcp) {
-		struct olsched_priv *ol_p;
+		struct ol_priv *ol_p;
 
 		tp = mptcp->tp;
 
@@ -1170,16 +1211,16 @@ static struct sk_buff *mptcp_ol_next_segment(struct sock *meta_sk,
 			break;
 
 		/* Correct the skb pointers of the current subflow */
-		ol_p = olsched_get_priv(tp);
-		olsched_correct_skb_pointers(meta_sk, ol_p);
+		ol_p = ol_get_priv(tp);
+		ol_correct_skb_pointers(meta_sk, ol_p);
 
-		skb = olsched_next_skb_from_queue(&meta_sk->sk_write_queue,
+		skb = ol_next_skb_from_queue(&meta_sk->sk_write_queue,
 						   ol_p->skb, meta_sk);
-		if (skb && olsched_use_subflow(meta_sk, active_valid_sks, tp,
+		if (skb && ol_use_subflow(meta_sk, active_valid_sks, tp,
 						skb)) {
 			ol_p->skb = skb;
 			ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
-			olsched_update_next_subflow(tp, ol_cb);
+			ol_update_next_subflow(tp, ol_cb);
 			*subsk = (struct sock *)tp;
 
 			if (TCP_SKB_CB(skb)->path_mask)
@@ -1201,8 +1242,8 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
-	struct olsched_cb *ol_cb = olsched_get_cb(meta_tp);
-	struct olsched_priv *ol_p;
+	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
+	struct ol_priv *ol_p;
 	struct tcp_sock *tp;
 	int active_valid_sks = -1;
 	struct sk_buff *skb;
@@ -1211,7 +1252,7 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 	int i = 0;
 	bool new_interval_started;
 
-	active_valid_sks = olsched_get_active_valid_sks_num(meta_sk);
+	active_valid_sks = ol_get_active_valid_sks_num(meta_sk);
 	
 	/* process ol model immediately, since sending nothing doesn't mean receiving nothing */
 	ol_process_all_subflows(meta_sk, &new_interval_started);
@@ -1249,20 +1290,20 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 			break;
 		tp = tcp_sk(sk);
 		// printk(KERN_DEBUG "ytxing: better tp:%p srtt: %u\n", tp, (tp->srtt_us >> 3));
-		ol_p = olsched_get_priv(tp);
-		olsched_correct_skb_pointers(meta_sk, ol_p);
+		ol_p = ol_get_priv(tp);
+		ol_correct_skb_pointers(meta_sk, ol_p);
 
-		olsched_check_quota(tp, ol_p, new_interval_started); // ytxing: if new_interval_started, refresh the quota.
+		ol_check_quota(tp, ol_p, new_interval_started); // ytxing: if new_interval_started, refresh the quota.
 		
 		if (ol_p->global_data->red_quota >= 1){ // Executing redundant routines
-			skb = olsched_next_skb_from_queue(&meta_sk->sk_write_queue,
+			skb = ol_next_skb_from_queue(&meta_sk->sk_write_queue,
 								ol_p->skb, meta_sk);
 		
-			if (skb && olsched_use_subflow(meta_sk, active_valid_sks, tp,
+			if (skb && ol_use_subflow(meta_sk, active_valid_sks, tp,
 							skb)) {
 				ol_p->skb = skb;
 				ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
-				olsched_update_next_subflow(tp, ol_cb);
+				ol_update_next_subflow(tp, ol_cb);
 				*subsk = (struct sock *)tp;
 				// printk(KERN_DEBUG "ytxing skb_len %u (mss?)\n", skb->len);
 				ol_p->global_data->red_quota -= 1;
@@ -1276,11 +1317,11 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 		}
 		else { // send a new skb, no need redundant
 			skb = tcp_send_head(meta_sk);
-			if (skb && olsched_use_subflow(meta_sk, active_valid_sks, tp,
+			if (skb && ol_use_subflow(meta_sk, active_valid_sks, tp,
 							skb)) {
 				ol_p->skb = skb;
 				ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
-				olsched_update_next_subflow(tp, ol_cb);
+				ol_update_next_subflow(tp, ol_cb);
 				*subsk = (struct sock *)tp;
 				// printk(KERN_DEBUG "ytxing skb_len %u (mss?)\n", skb->len);
 				ol_p->global_data->new_quota -= 1;
@@ -1301,28 +1342,28 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 	return NULL;
 }
 
-static void olsched_release(struct sock *sk)
+static void ol_release(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	
-	struct olsched_priv *ol_p = olsched_get_priv(tcp_sk(sk));
-	struct olsched_cb *ol_cb = olsched_get_cb(tp);
+	struct ol_priv *ol_p = ol_get_priv(tcp_sk(sk));
+	struct ol_cb *ol_cb = ol_get_cb(tp);
 
 	/* Check if the next subflow would be the released one. If yes correct
 	 * the pointer
 	 */
 	if (ol_cb->next_subflow == tp)
-		olsched_update_next_subflow(tp, ol_cb);
+		ol_update_next_subflow(tp, ol_cb);
 
 	kfree(ol_p->intervals_data);
 	kfree(ol_p->global_data);
 }
 
-static void olsched_init(struct sock *sk)
+static void ol_init(struct sock *sk)
 {
-	struct olsched_priv *ol_p = olsched_get_priv(tcp_sk(sk));
+	struct ol_priv *ol_p = ol_get_priv(tcp_sk(sk));
 	int i;
-	struct olsched_cb *ol_cb = olsched_get_cb(tcp_sk(mptcp_meta_sk(sk)));
+	struct ol_cb *ol_cb = ol_get_cb(tcp_sk(mptcp_meta_sk(sk)));
 
 
 	ol_p->intervals_data = kzalloc(sizeof(struct ol_interval) * OLSCHED_INTERVALS_NUM, GFP_KERNEL);
@@ -1343,6 +1384,8 @@ static void olsched_init(struct sock *sk)
 	ol_p->global_data->waiting = false;
 	ol_p->global_data->red_quota = 0;
 	ol_p->global_data->new_quota = 0;
+	ol_p->global_data->decoupled_bandwdith = 0;
+	ol_p->global_data->bwd_update_time = 0;
 
 
 	if (!ol_cb->meta_interval){
@@ -1353,7 +1396,7 @@ static void olsched_init(struct sock *sk)
 		ol_cb->meta_interval->snd_ended = false;
 		ol_cb->meta_interval->rcv_ended = false;
 		ol_cb->meta_interval->snd_seq_begin = 0;
-		printk(KERN_DEBUG "ytxing: olsched_init meta_interval meta_tp:%p\n", tcp_sk(mptcp_meta_sk(sk)));
+		printk(KERN_DEBUG "ytxing: ol_init meta_interval meta_tp:%p\n", tcp_sk(mptcp_meta_sk(sk)));
 	}
 
 	/* if this is the first tp initiated, it will be the first gambler. */
@@ -1368,7 +1411,7 @@ static void olsched_init(struct sock *sk)
 		ol_update_arm_probality(mptcp_meta_sk(sk));
 		ol_cb->gambler->current_arm_idx = 0;
 		ol_cb->gambler->arm_count[0] ++;
-		printk(KERN_DEBUG "ytxing: olsched_init gambler meta_tp:%p\n", tcp_sk(mptcp_meta_sk(sk)));
+		printk(KERN_DEBUG "ytxing: ol_init gambler meta_tp:%p\n", tcp_sk(mptcp_meta_sk(sk)));
 	}
 	
 	ol_cb->monitor->state = OL_CHANGE;
@@ -1384,26 +1427,26 @@ static void olsched_init(struct sock *sk)
 	}
 
 
-	printk(KERN_DEBUG "ytxing: olsched_init tp:%p\n", tcp_sk(sk));
+	printk(KERN_DEBUG "ytxing: ol_init tp:%p\n", tcp_sk(sk));
 	if(!tcp_is_sack(tcp_sk(sk)))
-		printk(KERN_DEBUG "ytxing: olsched_init tp:%p is not sack, maybe bad.\n", tcp_sk(sk));
+		printk(KERN_DEBUG "ytxing: ol_init tp:%p is not sack, maybe bad.\n", tcp_sk(sk));
 }
 
 static struct mptcp_sched_ops mptcp_sched_ol = {
 	.get_subflow = ol_get_available_subflow,
 	.next_segment = mptcp_ol_next_segment_rtt,
-	.init = olsched_init,
-	.release = olsched_release,
+	.init = ol_init,
+	.release = ol_release,
 	.name = "ol",
 	.owner = THIS_MODULE,
 };
 
 static int __init ol_register(void)
 {
-	printk(KERN_DEBUG "ytxing: olsched_priv size :%lu (< %u)\n", sizeof(struct olsched_priv), MPTCP_SCHED_SIZE);
-	printk(KERN_DEBUG "ytxing: olsched_cb size :%lu (< %u)\n", sizeof(struct olsched_cb), MPTCP_SCHED_DATA_SIZE);
-	BUILD_BUG_ON(sizeof(struct olsched_priv) > MPTCP_SCHED_SIZE);
-	BUILD_BUG_ON(sizeof(struct olsched_cb) > MPTCP_SCHED_DATA_SIZE);
+	printk(KERN_DEBUG "ytxing: ol_priv size :%lu (< %u)\n", sizeof(struct ol_priv), MPTCP_SCHED_SIZE);
+	printk(KERN_DEBUG "ytxing: ol_cb size :%lu (< %u)\n", sizeof(struct ol_cb), MPTCP_SCHED_DATA_SIZE);
+	BUILD_BUG_ON(sizeof(struct ol_priv) > MPTCP_SCHED_SIZE);
+	BUILD_BUG_ON(sizeof(struct ol_cb) > MPTCP_SCHED_DATA_SIZE);
 	if (mptcp_register_scheduler(&mptcp_sched_ol))
 		return -1;
 	return 0;
