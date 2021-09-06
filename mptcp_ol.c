@@ -127,6 +127,7 @@ enum OL_MONITOR_STATE {
 /* it is to store the avg_arm_reward, loss rate and RTT fo a subflow in current "stable" condition */
 struct ol_monitor {
 	u64 avg_arm_reward[OLSCHED_ARMS_NUM]; // 使用滑动窗口来弄吧
+	enum OL_MONITOR_STATE state;
 };
 
 struct ol_global {
@@ -580,6 +581,17 @@ static void update_interval_info_rcv(struct ol_interval *interval, struct tcp_so
 		interval->rcv_ended = true;
 		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u lost:%u bytes:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3);
 		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, olsched_get_bandwidth_interval(interval, tp));
+		return;
+	}
+	/* ytxing: something wrong here */
+	if (!is_meta_tp(tp) && interval->snd_ended && !before(interval->known_seq, interval->snd_seq_end)) {
+		interval->delivered_end = tp->delivered;
+		interval->lost_end = tp->lost;
+		interval->rcv_time_end = tp->tcp_mstamp;
+		interval->rcv_ended = true;
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u WTF RCV END delivered:%u lost:%u bytes:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3);
+		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u WTF RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, olsched_get_bandwidth_interval(interval, tp));
+		return;
 	}
 
 }
@@ -652,17 +664,21 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 	return reward;
 }
 
-/* was the ol struct fully inited */
-bool check_avg_reward(u64 curr_reward, struct ol_gambler *gambler, struct ol_monitor *monitor)
-{	
-	u64 prev_avg_reward = monitor->avg_arm_reward[gambler->previous_arm_idx];
-	if (prev_avg_reward == 0){
-		monitor->avg_arm_reward[gambler->previous_arm_idx] = curr_reward;
-		return false;
-	}
+// /* was the ol struct fully inited */
+// bool ol_check_reward_difference(u64 curr_reward, struct ol_gambler *gambler, struct ol_monitor *monitor)
+// {	
+// 	bool different_reward = false;
+// 	int arm_idx = gambler->previous_arm_idx;
+// 	if (monitor->avg_arm_reward[arm_idx] == 0){
+// 		monitor->avg_arm_reward[arm_idx] = curr_reward;
+// 	}
+// 	/* check different_reward */
+// 	if ()
 
-	return true /* different reward? */;
-}
+// 	/* update avg reward */
+
+// 	return true /* different reward? */;
+// }
 
 /* The Exp3 Algorithm: 
  * 1. set arm probability according to arm weight
@@ -691,7 +707,7 @@ static void ol_exp3_update(struct sock *meta_sk)
 	/* receive reward from the network */
 	reward = ol_calc_reward(meta_sk); // reward << OLSCHED_SCALE, actually. Since 0 < reward <= 1. 
 
-	check_avg_reward(reward, gambler, monitor);
+	// check_avg_reward(reward, gambler, monitor);
 
 	reward *= OLSCHED_UNIT; /* arm_probability is in OLSCHED_UNIT, so expand the dividend */
 	do_div(reward, gambler->arm_probability[gambler->previous_arm_idx]);
@@ -782,7 +798,8 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 		}
 
 		/* RCV INFO */
-		update_interval_info_rcv(interval, tp);
+		if (interval->rcv_ended == false)
+			update_interval_info_rcv(interval, tp);
 	}
 
 	/* SND INFO META */
@@ -820,7 +837,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) WTF too few sks, do not update\n", meta_tp);
 	}
 	
-	new_gamma_flag = ol_check_reward_difference(meta_sk);
+	// new_gamma_flag = ol_check_reward_difference(meta_sk);
 
 	/* pull an arm for all subflows */
 	arm_idx = pull_the_arm_accordingly(meta_sk);
@@ -1310,7 +1327,7 @@ static void olsched_init(struct sock *sk)
 
 	ol_p->intervals_data = kzalloc(sizeof(struct ol_interval) * OLSCHED_INTERVALS_NUM, GFP_KERNEL);
 	ol_p->global_data = kzalloc(sizeof(struct ol_global), GFP_KERNEL);
-	ol_p->global_data->monitor = kzalloc(sizeof(struct ol_monitor), GFP_KERNEL);
+	ol_cb->monitor = kzalloc(sizeof(struct ol_monitor), GFP_KERNEL);
 
 	for (i = 0; i < OLSCHED_INTERVALS_NUM; i++){
 		ol_p->intervals_data[i].index = i;
@@ -1323,14 +1340,10 @@ static void olsched_init(struct sock *sk)
 
 	ol_p->global_data->red_ratio = OLSCHED_INIT_RED_RATIO;
 	ol_p->global_data->last_time_delivered = OLSCHED_MIN_QUOTA;
-	ol_p->global_data->monitor->state = OL_CHANGE;
 	ol_p->global_data->waiting = false;
 	ol_p->global_data->red_quota = 0;
 	ol_p->global_data->new_quota = 0;
 
-	for (i = 0; i < OLSCHED_INTERVALS_NUM; i++){
-		ol_p->global_data->monitor->avg_arm_reward[i] = 0;
-	}
 
 	if (!ol_cb->meta_interval){
 		ol_cb->meta_interval = kzalloc(sizeof(struct ol_interval) * OLSCHED_INTERVALS_NUM, GFP_KERNEL);
@@ -1358,6 +1371,11 @@ static void olsched_init(struct sock *sk)
 		printk(KERN_DEBUG "ytxing: olsched_init gambler meta_tp:%p\n", tcp_sk(mptcp_meta_sk(sk)));
 	}
 	
+	ol_cb->monitor->state = OL_CHANGE;
+	for (i = 0; i < OLSCHED_INTERVALS_NUM; i++){
+		ol_cb->monitor->avg_arm_reward[i] = 0;
+	}
+
 	ol_p->global_data->init = 1;
 
 	start_current_send_interval(tcp_sk(sk));
