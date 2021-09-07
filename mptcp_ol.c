@@ -32,10 +32,15 @@ typedef __s64 s64;
 
 #define DEBUG_FIX_ARM false
 #define DEBUG_FIXED_ARM_IDX 0
+#define DEBUG_USE_DECOUPLED_BWD true
 
 #define OLSCHED_INTERVALS_NUM 1
 #define OLSCHED_INTERVALS_MIN_DURATION 100 * USEC_PER_MSEC /* minimal duration(us) */
-#define OLSCHED_INTERVALS_DURATION_N_RTT 3/2 /* minimal duration(us) */
+
+/* ytxing:
+ * tried 3/2, it seems that longer duration is better.
+ */
+#define OLSCHED_INTERVALS_DURATION_N_RTT 5 /* n * RTT */
 #define OLSCHED_INTERVALS_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 3
 #define OLSCHED_DCP_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 10 /* a timeout for decoupled bandwidth */
 #define OLSCHED_INTERVAL_MIN_PACKETS 30
@@ -57,13 +62,17 @@ typedef __s64 s64;
 
 
 /* ytxing: for utility function calculation */
-#define OLSCHED_GAMMA_MAB 20 /* div by OLSCHED_GAMMA_MAB_BASE */ 
+#define OLSCHED_GAMMA_MAB 10 /* div by OLSCHED_GAMMA_MAB_BASE */ 
 #define OLSCHED_GAMMA_MAB_BASE 100
 
-static const u16 ol_arm_to_red_ratio[4] = {
+// static const u16 ol_arm_to_red_ratio[4] = {
+// 	OLSCHED_UNIT * 1,
+// 	OLSCHED_UNIT * 2 / 3,
+// 	OLSCHED_UNIT * 1 / 3,
+// 	OLSCHED_MIN_RED_RATIO
+// };
+static const u16 ol_arm_to_red_ratio[2] = {
 	OLSCHED_UNIT * 1,
-	OLSCHED_UNIT * 2 / 3,
-	OLSCHED_UNIT * 1 / 3,
 	OLSCHED_MIN_RED_RATIO
 };
 #define OLSCHED_ARMS_NUM sizeof(ol_arm_to_red_ratio)/sizeof(ol_arm_to_red_ratio[0])
@@ -512,6 +521,7 @@ u8 pull_the_arm_accordingly(struct sock *meta_sk)
 
 	/* if we need to decouple subflows to estimate bandwidth of them */
 	if (gambler->force_decoupled){
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) force_decoupled\n");
 		gambler->force_decoupled = false;
 		gambler->current_arm_idx = 0;
 		return 0;
@@ -686,13 +696,13 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 		ol_p = ol_get_priv(tp);
 		interval = &ol_p->intervals_data[0];
 
-		ol_update_decoupled_bandwidth_interval(gambler, interval, tp);
 
-		if (ol_p->global_data->decoupled_bandwdith == 0){
-			subflow_throughput_sum += ol_get_bandwidth_interval(interval, tp);
+		if (DEBUG_USE_DECOUPLED_BWD){
+			ol_update_decoupled_bandwidth_interval(gambler, interval, tp);
+			subflow_throughput_sum += ol_p->global_data->decoupled_bandwdith;
 		}
 		else {
-			subflow_throughput_sum += ol_p->global_data->decoupled_bandwdith;
+			subflow_throughput_sum += ol_get_bandwidth_interval(interval, tp);
 		}
 	}
 	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) calc reward subflow_throughput_sum:%llu\n", meta_tp, subflow_throughput_sum);
@@ -701,7 +711,7 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 		return 0;
 	reward = meta_throughput * OLSCHED_UNIT;
 	do_div(reward, subflow_throughput_sum);
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) reward:%llu/1024\n", meta_tp, reward >> 3);
+	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm:%d reward:%llu/1024\n", meta_tp, gambler->previous_arm_idx, reward >> 3);
 	return reward;
 }
 
@@ -757,8 +767,8 @@ static void ol_exp3_update(struct sock *meta_sk)
 	do_div(reward, OLSCHED_ARMS_NUM * OLSCHED_GAMMA_MAB_BASE);
 	
 	exp_reward = ol_exp(reward);
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) reward:%llu exp_reward:%llu\n", meta_tp, reward >> 3, exp_reward >> 3);
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_weight[%d]:%llu\n", meta_tp, gambler->previous_arm_idx, gambler->arm_weight[gambler->previous_arm_idx]);
+	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) reward:%llu exp_reward:%llu\n", meta_tp, reward >> 3, exp_reward >> 3);
+	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_weight[%d]:%llu\n", meta_tp, gambler->previous_arm_idx, gambler->arm_weight[gambler->previous_arm_idx]);
 	temp = gambler->arm_weight[gambler->previous_arm_idx] * exp_reward;
 	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) temp:%llu\n", meta_tp, temp);
 	temp >>= OLSCHED_SCALE;
@@ -779,7 +789,7 @@ static void ol_exp3_update(struct sock *meta_sk)
 
 
 	/* Since arm_weight is stored in OLSCHED_UNIT, *= will multiply it to OLSCHED_UNIT^2 */
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_weight[%d]:%llu\n", meta_tp, gambler->previous_arm_idx, gambler->arm_weight[gambler->previous_arm_idx]);
+	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_weight[%d]:%llu\n", meta_tp, gambler->previous_arm_idx, gambler->arm_weight[gambler->previous_arm_idx]);
 
 	/* update the probility of previous arm accordingly */
 	ol_update_arm_probality(meta_sk);
@@ -1408,6 +1418,7 @@ static void ol_init(struct sock *sk)
 			ol_cb->gambler->arm_count[i] = 0;
 		}
 		ol_cb->gambler->curr_gamma = OLSCHED_GAMMA_MAB;
+		ol_cb->gambler->force_decoupled = false;
 		ol_update_arm_probality(mptcp_meta_sk(sk));
 		ol_cb->gambler->current_arm_idx = 0;
 		ol_cb->gambler->arm_count[0] ++;
