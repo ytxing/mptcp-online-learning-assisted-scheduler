@@ -42,7 +42,7 @@ typedef __s64 s64;
  */
 #define OLSCHED_INTERVALS_DURATION_N_RTT 5 /* n * RTT */
 #define OLSCHED_INTERVALS_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 3
-#define OLSCHED_DCP_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 10 /* a timeout for decoupled bandwidth */
+#define OLSCHED_DCP_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 50 /* a timeout for decoupled bandwidth */
 #define OLSCHED_INTERVAL_MIN_PACKETS 30
 
 #define OLSCHED_SAFE_MAX_WEIGHT 0x0000000fffffffff /* u32 */
@@ -60,6 +60,7 @@ typedef __s64 s64;
 #define OLSCHED_GRAD_MIN_STEP (OLSCHED_UNIT >> 4)
 #define OLSCHED_START_STEP (OLSCHED_UNIT >> 3)
 
+#define OLSCHED_CHANGING_THR 3
 
 /* ytxing: for utility function calculation */
 #define OLSCHED_GAMMA_MAB 10 /* div by OLSCHED_GAMMA_MAB_BASE */ 
@@ -136,8 +137,10 @@ enum OL_MONITOR_STATE {
 
 /* it is to store the avg_arm_reward, loss rate and RTT fo a subflow in current "stable" condition */
 struct ol_monitor {
-	u64 avg_arm_reward[OLSCHED_ARMS_NUM]; // 使用滑动窗口来弄吧
+	u64 avg_arm_reward[OLSCHED_ARMS_NUM]; // update like smoothed rtt
 	enum OL_MONITOR_STATE state;
+	u8 changing_count[OLSCHED_ARMS_NUM]; /* exceeding OLSCHED_CHANGING_THR indicates that the model need a restart */
+	u8 state_duration_left; /* how many intervals left to change to a smaller gamma? TODO not sure */
 };
 
 struct ol_global {
@@ -277,7 +280,7 @@ static void ol_update_decoupled_bandwidth_interval(struct ol_gambler *gambler, s
 	u64 curr_bandwidth = ol_get_bandwidth_interval(interval, tp);
 
 	if (gambler->previous_arm_idx != 0){
-		if (after(tp->tcp_mstamp, ol_p->global_data->bwd_update_time + OLSCHED_DCP_BWD_TIMEOUT)){
+		if (tp->tcp_mstamp > ol_p->global_data->bwd_update_time + OLSCHED_DCP_BWD_TIMEOUT){
 			gambler->force_decoupled = true;
 		}
 		return;
@@ -521,7 +524,7 @@ u8 pull_the_arm_accordingly(struct sock *meta_sk)
 
 	/* if we need to decouple subflows to estimate bandwidth of them */
 	if (gambler->force_decoupled){
-		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) force_decoupled\n");
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) force_decoupled\n", meta_tp);
 		gambler->force_decoupled = false;
 		gambler->current_arm_idx = 0;
 		return 0;
@@ -583,20 +586,6 @@ static void update_interval_info_snd(struct ol_interval *interval, struct tcp_so
 	interval->snd_time_end = tp->tcp_mstamp;
 
 	// printk(KERN_DEBUG "ytxing: tp:%p idx: %u snd_seq:%u->%u(%u)\n", tp, interval->index, interval->snd_seq_begin, interval->snd_seq_end, interval->snd_seq_end - interval->snd_seq_begin);
-}
-
-static void update_all_subflow_interval_info_snd(struct tcp_sock *meta_tp)
-{
-	struct mptcp_tcp_sock *mptcp;
-	struct mptcp_cb *mpcb = meta_tp->mpcb;
-
-	mptcp_for_each_sub(mpcb, mptcp) {	
-		struct tcp_sock *tp = mptcp->tp;
-		struct ol_priv *ol_p = ol_get_priv(tp);
-
-		update_interval_info_snd(&ol_p->intervals_data[0], tp);
-	}
-
 }
 
 /* ytxing:
@@ -715,21 +704,52 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 	return reward;
 }
 
-// /* was the ol struct fully inited */
-// bool ol_check_reward_difference(u64 curr_reward, struct ol_gambler *gambler, struct ol_monitor *monitor)
-// {	
-// 	bool different_reward = false;
-// 	int arm_idx = gambler->previous_arm_idx;
-// 	if (monitor->avg_arm_reward[arm_idx] == 0){
-// 		monitor->avg_arm_reward[arm_idx] = curr_reward;
-// 	}
-// 	/* check different_reward */
-// 	if ()
+bool ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
+{	
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
+	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
+	struct ol_gambler *gambler = ol_cb->gambler;
+	struct ol_monitor *monitor = ol_cb->monitor;
+	int i;
 
-// 	/* update avg reward */
+	int arm_idx = gambler->previous_arm_idx;
 
-// 	return true /* different reward? */;
-// }
+	if (monitor->avg_arm_reward[arm_idx] == 0){
+		monitor->avg_arm_reward[arm_idx] = curr_reward;
+		return false;
+	}
+
+	/* check different_reward */
+	if (curr_reward > monitor->avg_arm_reward[arm_idx] + OLSCHED_UNIT / 3 || curr_reward < max_t(s64, monitor->avg_arm_reward[arm_idx] - OLSCHED_UNIT / 3, 0)){
+		monitor->changing_count[arm_idx] ++;
+
+		if (monitor->changing_count[arm_idx] >= OLSCHED_CHANGING_THR){
+			// monitor->state = OL_CHANGE;
+			printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MONITOR reset all weights\n", meta_tp);
+
+			/* reset the weight of each arm */
+			for (i = 0; i < OLSCHED_ARMS_NUM; i++){
+				gambler->arm_weight[i] = OLSCHED_UNIT;
+				gambler->arm_count[i] = 0;
+			}
+
+			/* reset the avg reward of each arm */
+			for (i = 0; i < OLSCHED_ARMS_NUM; i++){
+				monitor->avg_arm_reward[arm_idx] = 0;
+			}
+
+			monitor->changing_count[arm_idx] = 0;
+			/* tune gamma for a period of time TODO*/
+		}
+		return true;
+	}
+
+	/* if no big difference, update avg reward */
+	monitor->changing_count[arm_idx] = 0; /* we need consequent changing counts */
+	monitor->avg_arm_reward[arm_idx] = monitor->avg_arm_reward[arm_idx] - (monitor->avg_arm_reward[arm_idx] >> 3) + (curr_reward >> 3);
+
+	return false /* different reward? */;
+}
 
 /* The Exp3 Algorithm: 
  * 1. set arm probability according to arm weight
@@ -747,7 +767,7 @@ static void ol_exp3_update(struct sock *meta_sk)
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 	struct ol_gambler *gambler = ol_cb->gambler;
-	struct ol_monitor *monitor = ol_cb->monitor;
+	// struct ol_monitor *monitor = ol_cb->monitor;
 	u64 reward, exp_reward;
 	u64 temp;
 	int i;
@@ -757,10 +777,15 @@ static void ol_exp3_update(struct sock *meta_sk)
 
 	/* receive reward from the network */
 	reward = ol_calc_reward(meta_sk); // reward << OLSCHED_SCALE, actually. Since 0 < reward <= 1. 
+	
+	ol_check_reward_difference(reward, meta_sk);
 
 	// check_avg_reward(reward, gambler, monitor);
 
 	reward *= OLSCHED_UNIT; /* arm_probability is in OLSCHED_UNIT, so expand the dividend */
+	if (gambler->arm_probability[gambler->previous_arm_idx] == 0){ /* impossible... */
+		ol_update_arm_probality(meta_sk);
+	}
 	do_div(reward, gambler->arm_probability[gambler->previous_arm_idx]);
 	// interval->arm_weight[interval->previous_arm_idx] update;
 	reward *= OLSCHED_GAMMA_MAB;
@@ -781,7 +806,7 @@ static void ol_exp3_update(struct sock *meta_sk)
 		\********************************************/
 		for (i = 0; i < OLSCHED_ARMS_NUM; i++){
 			gambler->arm_weight[i] = max_t(u64, OLSCHED_UNIT, gambler->arm_weight[i] >> 8);
-			printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) shrink arm_weight[%dx]:%llu\n", meta_tp, i, gambler->arm_weight[i]);
+			printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) shrink arm_weight[%d]:%llu\n", meta_tp, i, gambler->arm_weight[i]);
 		}
 		temp = (gambler->arm_weight[gambler->previous_arm_idx] * ol_exp(reward)) >> OLSCHED_SCALE;
 	}
@@ -789,7 +814,7 @@ static void ol_exp3_update(struct sock *meta_sk)
 
 
 	/* Since arm_weight is stored in OLSCHED_UNIT, *= will multiply it to OLSCHED_UNIT^2 */
-	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_weight[%d]:%llu\n", meta_tp, gambler->previous_arm_idx, gambler->arm_weight[gambler->previous_arm_idx]);
+	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_weight[%d]:%llu\n", meta_tp, gambler->previous_arm_idx, gambler->arm_weight[gambler->previous_arm_idx]);
 
 	/* update the probility of previous arm accordingly */
 	ol_update_arm_probality(meta_sk);
@@ -823,7 +848,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 	u32 interval_duration;
 	u8 arm_idx;
 
-	bool new_gamma_flag;
+	// bool new_gamma_flag;
 
 	*new_interval_started = false;
 
@@ -888,7 +913,6 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) WTF too few sks, do not update\n", meta_tp);
 	}
 	
-	// new_gamma_flag = ol_check_reward_difference(meta_sk);
 
 	/* pull an arm for all subflows */
 	arm_idx = pull_the_arm_accordingly(meta_sk);
@@ -1439,8 +1463,8 @@ static void ol_init(struct sock *sk)
 
 
 	printk(KERN_DEBUG "ytxing: ol_init tp:%p\n", tcp_sk(sk));
-	if(!tcp_is_sack(tcp_sk(sk)))
-		printk(KERN_DEBUG "ytxing: ol_init tp:%p is not sack, maybe bad.\n", tcp_sk(sk));
+	// if(!tcp_is_sack(tcp_sk(sk)))
+	// 	printk(KERN_DEBUG "ytxing: ol_init tp:%p is not sack, maybe bad.\n", tcp_sk(sk));
 }
 
 static struct mptcp_sched_ops mptcp_sched_ol = {
