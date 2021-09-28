@@ -33,6 +33,7 @@ typedef __s64 s64;
 #define DEBUG_FIX_ARM false
 #define DEBUG_FIXED_ARM_IDX 0
 #define DEBUG_USE_DECOUPLED_BWD true
+#define DEBUG_USE_WEIGHT_RESET false
 
 #define OLSCHED_INTERVALS_NUM 1
 #define OLSCHED_INTERVALS_MIN_DURATION 100 * USEC_PER_MSEC /* minimal duration(us) */
@@ -40,7 +41,7 @@ typedef __s64 s64;
 /* ytxing:
  * tried 3/2, it seems that longer duration is better.
  */
-#define OLSCHED_INTERVALS_DURATION_N_RTT 5 /* n * RTT */
+#define OLSCHED_INTERVALS_DURATION_N_RTT 3 /* n * RTT */
 #define OLSCHED_INTERVALS_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 3
 #define OLSCHED_DCP_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 50 /* a timeout for decoupled bandwidth */
 #define OLSCHED_INTERVAL_MIN_PACKETS 30
@@ -130,7 +131,7 @@ struct ol_interval {
 		unusued:4;
 };
 
-enum OL_MONITOR_STATE {
+enum OL_MON_STATE {
 	OL_CHANGE, // this tp is playing MAB game
 	OL_STAY, // another is playing game, I have to wait
 };
@@ -138,9 +139,11 @@ enum OL_MONITOR_STATE {
 /* it is to store the avg_arm_reward, loss rate and RTT fo a subflow in current "stable" condition */
 struct ol_monitor {
 	u64 avg_arm_reward[OLSCHED_ARMS_NUM]; // update like smoothed rtt
-	enum OL_MONITOR_STATE state;
+	enum OL_MON_STATE state;
 	u8 changing_count[OLSCHED_ARMS_NUM]; /* exceeding OLSCHED_CHANGING_THR indicates that the model need a restart */
 	u8 state_duration_left; /* how many intervals left to change to a smaller gamma? TODO not sure */
+	u64 avg_reward[OLSCHED_ARMS_NUM];
+	u64 mdev_reward[OLSCHED_ARMS_NUM];
 };
 
 struct ol_global {
@@ -385,12 +388,12 @@ bool ol_all_subflow_send_interval_ended(struct tcp_sock *meta_tp)
 			struct tcp_sock *tp = mptcp->tp;
 			struct ol_priv *ol_p = ol_get_priv(tp);
 			struct ol_interval *interval = &ol_p->intervals_data[0];
-			u32 packets_sent = tp->data_segs_out - interval->pkts_out_begin;
-			u32 interval_duration = interval->interval_duration;
+			// u32 packets_sent = tp->data_segs_out - interval->pkts_out_begin;
+			// u32 interval_duration = interval->interval_duration;
 
 			interval->snd_ended = true;
-			printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END packets_sent:%u bytes:%u\n", tp, is_meta_tp(tp), interval->index, packets_sent, interval->snd_seq_end - interval->snd_seq_begin);
-			printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END snd_duration:%llu interval_duration:%u\n", tp, is_meta_tp(tp), interval->index, interval->snd_time_end - interval->snd_time_begin, interval_duration);
+			// printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END packets_sent:%u bytes:%u\n", tp, is_meta_tp(tp), interval->index, packets_sent, interval->snd_seq_end - interval->snd_seq_begin);
+			// printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END snd_duration:%llu interval_duration:%u\n", tp, is_meta_tp(tp), interval->index, interval->snd_time_end - interval->snd_time_begin, interval_duration);
 		}
 
 	}
@@ -478,7 +481,7 @@ void start_current_send_interval(struct tcp_sock *tp)
 	global->waiting = false;
 	global->red_ratio = interval->red_ratio; 
 
-	printk(KERN_DEBUG "ytxing: tp:%p (sub_tp) start interval snd_idx: %u ratio: %u/1024\n", tp, interval->index, global->red_ratio >> 3);
+	// printk(KERN_DEBUG "ytxing: tp:%p (sub_tp) start interval snd_idx: %u ratio: %u/1024\n", tp, interval->index, global->red_ratio >> 3);
 }
 
 void ol_update_arm_probality(struct sock *meta_sk)
@@ -610,8 +613,8 @@ static void update_interval_info_rcv(struct ol_interval *interval, struct tcp_so
 		interval->lost_end = tp->lost;
 		interval->rcv_time_end = tp->tcp_mstamp;
 		interval->rcv_ended = true;
-		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u lost:%u bytes:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3);
-		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
+		// printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u lost:%u bytes:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3);
+		// printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
 		return;
 	}
 	/* ytxing: something wrong here */
@@ -620,8 +623,8 @@ static void update_interval_info_rcv(struct ol_interval *interval, struct tcp_so
 		interval->lost_end = tp->lost;
 		interval->rcv_time_end = tp->tcp_mstamp;
 		interval->rcv_ended = true;
-		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u WTF RCV END delivered:%u lost:%u bytes:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3);
-		printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u WTF RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
+		// printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u WTF RCV END delivered:%u lost:%u bytes:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3);
+		// printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u WTF RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
 		return;
 	}
 
@@ -668,7 +671,7 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 
 
 	meta_throughput = ol_get_bandwidth_interval(meta_interval, meta_tp);
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) calc reward meta_throughput:%llu\n", meta_tp, meta_throughput);
+	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) calc reward meta_throughput:%llu\n", meta_tp, meta_throughput);
 
 
 	/* ytxing:	in this loop, we 
@@ -694,7 +697,7 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 			subflow_throughput_sum += ol_get_bandwidth_interval(interval, tp);
 		}
 	}
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) calc reward subflow_throughput_sum:%llu\n", meta_tp, subflow_throughput_sum);
+	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) calc reward subflow_throughput_sum:%llu\n", meta_tp, subflow_throughput_sum);
 
 	if (subflow_throughput_sum == 0)
 		return 0;
@@ -714,34 +717,48 @@ bool ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 
 	int arm_idx = gambler->previous_arm_idx;
 
+	if (curr_reward > OLSCHED_UNIT){
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu too large arm:%d\n", meta_tp, curr_reward >> 3, arm_idx);
+		curr_reward = OLSCHED_UNIT;
+	}
+
 	if (monitor->avg_arm_reward[arm_idx] == 0){
-		monitor->avg_arm_reward[arm_idx] = curr_reward;
+		monitor->avg_arm_reward[arm_idx] = curr_reward;	
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu monitor->avg_arm_reward[%d]:%llu(+-%d)\n", meta_tp, curr_reward >> 3, arm_idx, monitor->avg_arm_reward[arm_idx] >> 3, (OLSCHED_UNIT / 3) >> 3);
 		return false;
 	}
 
+	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu monitor->avg_arm_reward[%d]:%llu(+-%d)\n", meta_tp, curr_reward >> 3, arm_idx, monitor->avg_arm_reward[arm_idx] >> 3, (OLSCHED_UNIT / 3) >> 3);
 	/* check different_reward */
-	if (curr_reward > monitor->avg_arm_reward[arm_idx] + OLSCHED_UNIT / 3 || curr_reward < max_t(s64, monitor->avg_arm_reward[arm_idx] - OLSCHED_UNIT / 3, 0)){
+	// if (curr_reward > monitor->avg_arm_reward[arm_idx] + OLSCHED_UNIT / 3 || curr_reward < max_t(s64, monitor->avg_arm_reward[arm_idx] - OLSCHED_UNIT / 3, 0)){
+	if (false){
+		monitor->avg_reward[arm_idx] = ((monitor->avg_reward[arm_idx] * monitor->changing_count[arm_idx]) + curr_reward) / (monitor->changing_count[arm_idx] + 1);
 		monitor->changing_count[arm_idx] ++;
 
 		if (monitor->changing_count[arm_idx] >= OLSCHED_CHANGING_THR){
 			// monitor->state = OL_CHANGE;
-			printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MONITOR reset all weights\n", meta_tp);
+			printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON exceed threshold\n", meta_tp);
 
 			/* reset the weight of each arm */
-			for (i = 0; i < OLSCHED_ARMS_NUM; i++){
-				gambler->arm_weight[i] = OLSCHED_UNIT;
-				gambler->arm_count[i] = 0;
+			if (DEBUG_USE_WEIGHT_RESET){
+				printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON reset weights\n", meta_tp);
+				for (i = 0; i < OLSCHED_ARMS_NUM; i++){
+					gambler->arm_weight[i] = OLSCHED_UNIT;
+					gambler->arm_count[i] = 0;
+				}
 			}
 
 			/* reset the avg reward of each arm */
 			for (i = 0; i < OLSCHED_ARMS_NUM; i++){
-				monitor->avg_arm_reward[arm_idx] = 0;
+				monitor->avg_arm_reward[arm_idx] = monitor->avg_reward[arm_idx];
 			}
-
+			
 			monitor->changing_count[arm_idx] = 0;
 			/* tune gamma for a period of time TODO*/
+			
+			return true;
 		}
-		return true;
+		return false;
 	}
 
 	/* if no big difference, update avg reward */
@@ -883,17 +900,17 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 		update_interval_info_snd(meta_interval, meta_tp);
 		if (ol_all_subflow_send_interval_ended(meta_tp)){
 			if (!ol_current_send_interval_end_ready(meta_interval, meta_tp)){
-				printk(KERN_DEBUG "ytxing: meta_tp:%p BUG subflows snd end but not meta\n", meta_tp);
+				// printk(KERN_DEBUG "ytxing: meta_tp:%p BUG subflows snd end but not meta\n", meta_tp);
 			}
 			/* end the meta snd interval, same as in ol_all_subflow_send_interval_ended */
 			packets_sent = meta_tp->data_segs_out - meta_interval->pkts_out_begin;
 			interval_duration = meta_interval->interval_duration;
 
 			meta_interval->snd_ended = true;
-			printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END packets_sent:%u bytes:%u\n",\
-				meta_tp, is_meta_tp(meta_tp), meta_interval->index, packets_sent, meta_interval->snd_seq_end - meta_interval->snd_seq_begin);
-			printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END actual_duration:%llu interval_duration:%u\n",\
-				meta_tp, is_meta_tp(meta_tp), meta_interval->index, meta_interval->snd_time_end - meta_interval->snd_time_begin, interval_duration);
+			// printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END packets_sent:%u bytes:%u\n",\
+			// 	meta_tp, is_meta_tp(meta_tp), meta_interval->index, packets_sent, meta_interval->snd_seq_end - meta_interval->snd_seq_begin);
+			// printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END actual_duration:%llu interval_duration:%u\n",\
+			// 	meta_tp, is_meta_tp(meta_tp), meta_interval->index, meta_interval->snd_time_end - meta_interval->snd_time_begin, interval_duration);
 		}
 	}
 	
@@ -1452,6 +1469,8 @@ static void ol_init(struct sock *sk)
 	ol_cb->monitor->state = OL_CHANGE;
 	for (i = 0; i < OLSCHED_INTERVALS_NUM; i++){
 		ol_cb->monitor->avg_arm_reward[i] = 0;
+		ol_cb->monitor->avg_reward[i] = 0;
+		ol_cb->monitor->mdev_reward[i] = 0;
 	}
 
 	ol_p->global_data->init = 1;
