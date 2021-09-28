@@ -34,6 +34,7 @@ typedef __s64 s64;
 #define DEBUG_FIXED_ARM_IDX 0
 #define DEBUG_USE_DECOUPLED_BWD true
 #define DEBUG_USE_WEIGHT_RESET false
+#define DEBUG_USE_GAMMA_TUNING true
 
 #define OLSCHED_INTERVALS_NUM 1
 #define OLSCHED_INTERVALS_MIN_DURATION 100 * USEC_PER_MSEC /* minimal duration(us) */
@@ -64,8 +65,10 @@ typedef __s64 s64;
 #define OLSCHED_CHANGING_THR 3
 
 /* ytxing: for utility function calculation */
-#define OLSCHED_GAMMA_MAB 10 /* div by OLSCHED_GAMMA_MAB_BASE */ 
+#define OLSCHED_LO_GAMMA_MAB 10 /* div by OLSCHED_GAMMA_MAB_BASE */ 
+#define OLSCHED_HI_GAMMA_MAB 50 /* div by OLSCHED_GAMMA_MAB_BASE */ 
 #define OLSCHED_GAMMA_MAB_BASE 100
+#define OLSCHED_HI_GAMMA_DURATION 50 
 
 // static const u16 ol_arm_to_red_ratio[4] = {
 // 	OLSCHED_UNIT * 1,
@@ -136,14 +139,16 @@ enum OL_MON_STATE {
 	OL_STAY, // another is playing game, I have to wait
 };
 
-/* it is to store the avg_arm_reward, loss rate and RTT fo a subflow in current "stable" condition */
+/* it is to store the smoothed_arm_reward, loss rate and RTT fo a subflow in current "stable" condition */
 struct ol_monitor {
-	u64 avg_arm_reward[OLSCHED_ARMS_NUM]; // update like smoothed rtt
+	u64 smoothed_arm_reward[OLSCHED_ARMS_NUM]; // update like smoothed rtt
+	u64 mdev_arm_reward[OLSCHED_ARMS_NUM]; // update like smoothed rtt
 	enum OL_MON_STATE state;
-	u8 changing_count[OLSCHED_ARMS_NUM]; /* exceeding OLSCHED_CHANGING_THR indicates that the model need a restart */
-	u8 state_duration_left; /* how many intervals left to change to a smaller gamma? TODO not sure */
-	u64 avg_reward[OLSCHED_ARMS_NUM];
-	u64 mdev_reward[OLSCHED_ARMS_NUM];
+	s8 changing_count[OLSCHED_ARMS_NUM]; /* exceeding OLSCHED_CHANGING_THR indicates that the model need a restart */
+	u8 hi_gamma_duration; /* how many intervals left to change to a smaller gamma? TODO not sure */
+	u64 avg_changed_reward[OLSCHED_ARMS_NUM];
+	u8 	hi_gamma_flag:1,
+		unused:7;
 };
 
 struct ol_global {
@@ -492,9 +497,21 @@ void ol_update_arm_probality(struct sock *meta_sk)
 
 	// struct ol_global *global = ol_p->global_data;
 
-	u64 arm_weight_sum = 0, gamma_over_K = (OLSCHED_UNIT * OLSCHED_GAMMA_MAB) / (OLSCHED_ARMS_NUM * OLSCHED_GAMMA_MAB_BASE);
+	u64 arm_weight_sum = 0, gamma_over_K, gamma;
 	u64 temp;
 	int i;
+
+	if (ol_cb->monitor->hi_gamma_flag && DEBUG_USE_GAMMA_TUNING){
+		gamma = OLSCHED_HI_GAMMA_MAB;
+		ol_cb->monitor->hi_gamma_duration --;
+		if (ol_cb->monitor->hi_gamma_duration == 0){
+			ol_cb->monitor->hi_gamma_flag = 0;
+		}
+	} else {
+		gamma = OLSCHED_LO_GAMMA_MAB;
+	}
+
+	gamma_over_K = (OLSCHED_UNIT * gamma) / (OLSCHED_ARMS_NUM * OLSCHED_GAMMA_MAB_BASE);
 
 	for (i = 0; i < OLSCHED_ARMS_NUM; i++){
 		arm_weight_sum += gambler->arm_weight[i];
@@ -502,11 +519,11 @@ void ol_update_arm_probality(struct sock *meta_sk)
 
 	for (i = 0; i < OLSCHED_ARMS_NUM; i++){
 		temp = (gambler->arm_weight[i] * OLSCHED_UNIT) / arm_weight_sum;
-		temp *= OLSCHED_GAMMA_MAB_BASE - OLSCHED_GAMMA_MAB;
+		temp *= OLSCHED_GAMMA_MAB_BASE - gamma;
 		temp /= OLSCHED_GAMMA_MAB_BASE;
 		gambler->arm_probability[i] = temp + gamma_over_K;
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_probability[%d]:%u/1024 count:%u\n", meta_tp, i, gambler->arm_probability[i] >> 3, gambler->arm_count[i]);
-		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) temp:%llu gamma_over_K:%llu\n", meta_tp, temp >> 3, gamma_over_K >> 3);
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) temp:%llu gamma_over_K:%llu hi_gamma left:%u\n", meta_tp, temp >> 3, gamma_over_K >> 3, ol_cb->monitor->hi_gamma_duration);
 	}
 
 }
@@ -707,65 +724,74 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 	return reward;
 }
 
-bool ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
+void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 {	
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 	struct ol_gambler *gambler = ol_cb->gambler;
 	struct ol_monitor *monitor = ol_cb->monitor;
+	s64 tmp_mdev;
 	int i;
 
 	int arm_idx = gambler->previous_arm_idx;
 
 	if (curr_reward > OLSCHED_UNIT){
-		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu too large arm:%d\n", meta_tp, curr_reward >> 3, arm_idx);
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu too large, arm:%d\n", meta_tp, curr_reward >> 3, arm_idx);
 		curr_reward = OLSCHED_UNIT;
 	}
 
-	if (monitor->avg_arm_reward[arm_idx] == 0){
-		monitor->avg_arm_reward[arm_idx] = curr_reward;	
-		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu monitor->avg_arm_reward[%d]:%llu(+-%d)\n", meta_tp, curr_reward >> 3, arm_idx, monitor->avg_arm_reward[arm_idx] >> 3, (OLSCHED_UNIT / 3) >> 3);
-		return false;
+	if (monitor->smoothed_arm_reward[arm_idx] == 0){
+		monitor->smoothed_arm_reward[arm_idx] = curr_reward;	
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu monitor->smoothed_arm_reward[%d]:%llu(+-%d)\n", meta_tp, curr_reward >> 3, arm_idx, monitor->smoothed_arm_reward[arm_idx] >> 3, (OLSCHED_UNIT / 3) >> 3);
+		return;
 	}
 
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu monitor->avg_arm_reward[%d]:%llu(+-%d)\n", meta_tp, curr_reward >> 3, arm_idx, monitor->avg_arm_reward[arm_idx] >> 3, (OLSCHED_UNIT / 3) >> 3);
 	/* check different_reward */
-	// if (curr_reward > monitor->avg_arm_reward[arm_idx] + OLSCHED_UNIT / 3 || curr_reward < max_t(s64, monitor->avg_arm_reward[arm_idx] - OLSCHED_UNIT / 3, 0)){
-	if (false){
-		monitor->avg_reward[arm_idx] = ((monitor->avg_reward[arm_idx] * monitor->changing_count[arm_idx]) + curr_reward) / (monitor->changing_count[arm_idx] + 1);
-		monitor->changing_count[arm_idx] ++;
-
-		if (monitor->changing_count[arm_idx] >= OLSCHED_CHANGING_THR){
-			// monitor->state = OL_CHANGE;
-			printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON exceed threshold\n", meta_tp);
-
-			/* reset the weight of each arm */
-			if (DEBUG_USE_WEIGHT_RESET){
-				printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON reset weights\n", meta_tp);
-				for (i = 0; i < OLSCHED_ARMS_NUM; i++){
-					gambler->arm_weight[i] = OLSCHED_UNIT;
-					gambler->arm_count[i] = 0;
-				}
-			}
-
-			/* reset the avg reward of each arm */
-			for (i = 0; i < OLSCHED_ARMS_NUM; i++){
-				monitor->avg_arm_reward[arm_idx] = monitor->avg_reward[arm_idx];
-			}
-			
+	if (curr_reward > monitor->smoothed_arm_reward[arm_idx] + monitor->mdev_arm_reward[arm_idx]){ /* get higher reward */
+		if (monitor->changing_count[arm_idx] <= 0){
 			monitor->changing_count[arm_idx] = 0;
-			/* tune gamma for a period of time TODO*/
-			
-			return true;
 		}
-		return false;
+		monitor->changing_count[arm_idx] ++;
 	}
 
-	/* if no big difference, update avg reward */
-	monitor->changing_count[arm_idx] = 0; /* we need consequent changing counts */
-	monitor->avg_arm_reward[arm_idx] = monitor->avg_arm_reward[arm_idx] - (monitor->avg_arm_reward[arm_idx] >> 3) + (curr_reward >> 3);
+	if (curr_reward < max_t(s64, monitor->smoothed_arm_reward[arm_idx] - monitor->mdev_arm_reward[arm_idx], 0)){ /* get lower reward */
+		if (monitor->changing_count[arm_idx] >= 0){
+			monitor->changing_count[arm_idx] = 0;
+		}
+		monitor->changing_count[arm_idx] --;
+	}
 
-	return false /* different reward? */;
+	if (abs(monitor->changing_count[arm_idx]) >= OLSCHED_CHANGING_THR){
+		// monitor->state = OL_CHANGE;
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON exceed threshold changing_count:%d\n", meta_tp, monitor->changing_count[arm_idx]);
+
+		/* reset the weight of each arm */
+		if (DEBUG_USE_WEIGHT_RESET){
+			printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON reset weights\n", meta_tp);
+			for (i = 0; i < OLSCHED_ARMS_NUM; i++){
+				gambler->arm_weight[i] = OLSCHED_UNIT;
+				gambler->arm_count[i] = 0;
+			}
+		}
+
+		/* tune gamma for a period of time TODO*/
+		if (DEBUG_USE_GAMMA_TUNING){
+			ol_cb->monitor->hi_gamma_flag = 1;
+			ol_cb->monitor->hi_gamma_duration = OLSCHED_HI_GAMMA_DURATION;
+		}
+
+		monitor->changing_count[arm_idx] = 0;
+	}
+
+	/* always update avg reward */
+	tmp_mdev = curr_reward - monitor->smoothed_arm_reward[arm_idx];
+	monitor->mdev_arm_reward[arm_idx] = monitor->mdev_arm_reward[arm_idx] - (monitor->mdev_arm_reward[arm_idx] >> 2) + (abs(tmp_mdev) >> 2);
+	monitor->smoothed_arm_reward[arm_idx] = monitor->smoothed_arm_reward[arm_idx] - (monitor->smoothed_arm_reward[arm_idx] >> 3) + (curr_reward >> 3);
+
+
+	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu smoothed_arm_reward[%d]:%llu mdev_arm_reward:%llu)\n", meta_tp, curr_reward >> 3, arm_idx, monitor->smoothed_arm_reward[arm_idx] >> 3, monitor->mdev_arm_reward[arm_idx] >> 3);
+
+	return;
 }
 
 /* The Exp3 Algorithm: 
@@ -805,7 +831,7 @@ static void ol_exp3_update(struct sock *meta_sk)
 	}
 	do_div(reward, gambler->arm_probability[gambler->previous_arm_idx]);
 	// interval->arm_weight[interval->previous_arm_idx] update;
-	reward *= OLSCHED_GAMMA_MAB;
+	reward *= OLSCHED_LO_GAMMA_MAB;
 	do_div(reward, OLSCHED_ARMS_NUM * OLSCHED_GAMMA_MAB_BASE);
 	
 	exp_reward = ol_exp(reward);
@@ -1458,7 +1484,7 @@ static void ol_init(struct sock *sk)
 			ol_cb->gambler->arm_weight[i] = OLSCHED_UNIT;
 			ol_cb->gambler->arm_count[i] = 0;
 		}
-		ol_cb->gambler->curr_gamma = OLSCHED_GAMMA_MAB;
+		ol_cb->gambler->curr_gamma = OLSCHED_LO_GAMMA_MAB;
 		ol_cb->gambler->force_decoupled = false;
 		ol_update_arm_probality(mptcp_meta_sk(sk));
 		ol_cb->gambler->current_arm_idx = 0;
@@ -1468,9 +1494,12 @@ static void ol_init(struct sock *sk)
 	
 	ol_cb->monitor->state = OL_CHANGE;
 	for (i = 0; i < OLSCHED_INTERVALS_NUM; i++){
-		ol_cb->monitor->avg_arm_reward[i] = 0;
-		ol_cb->monitor->avg_reward[i] = 0;
-		ol_cb->monitor->mdev_reward[i] = 0;
+		ol_cb->monitor->smoothed_arm_reward[i] = 0;
+		ol_cb->monitor->mdev_arm_reward[i] = 0;
+		ol_cb->monitor->avg_changed_reward[i] = 0;
+		ol_cb->monitor->changing_count[i] = 0;
+		ol_cb->monitor->hi_gamma_flag = 1;
+		ol_cb->monitor->hi_gamma_duration = OLSCHED_HI_GAMMA_DURATION;
 	}
 
 	ol_p->global_data->init = 1;
