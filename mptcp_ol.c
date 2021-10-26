@@ -32,9 +32,15 @@ typedef __s64 s64;
 
 #define DEBUG_FIX_ARM false
 #define DEBUG_FIXED_ARM_IDX 0
-#define DEBUG_USE_DECOUPLED_BWD true
-#define DEBUG_USE_WEIGHT_RESET false
-#define DEBUG_USE_GAMMA_TUNING true
+#define DEBUG_USE_DECOUPLED_BWD false
+#define DEBUG_USE_MAX_BWD true
+#define DEBUG_USE_NEW_EPOCH true
+#define DEBUG_USE_GAMMA_TUNING false
+
+/* new epoch or gamma */
+#define OLSCHED_EPOCH_DURATION 100
+#define OLSCHED_HI_GAMMA_DURATION 50 
+#define OLSCHED_MDEV_MUL 3
 
 #define OLSCHED_INTERVALS_NUM 1
 #define OLSCHED_INTERVALS_MIN_DURATION 100 * USEC_PER_MSEC /* minimal duration(us) */
@@ -44,7 +50,8 @@ typedef __s64 s64;
  */
 #define OLSCHED_INTERVALS_DURATION_N_RTT 3 /* n * RTT */
 #define OLSCHED_INTERVALS_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 3
-#define OLSCHED_DCP_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 50 /* a timeout for decoupled bandwidth */
+#define OLSCHED_DCP_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 30 /* a timeout for decoupled bandwidth */
+#define OLSCHED_MAX_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 30 /* a timeout for decoupled bandwidth */
 #define OLSCHED_INTERVAL_MIN_PACKETS 30
 
 #define OLSCHED_SAFE_MAX_WEIGHT 0x0000000fffffffff /* u32 */
@@ -56,19 +63,14 @@ typedef __s64 s64;
 #define OLSCHED_MAX_RED_RATIO OLSCHED_UNIT
 #define OLSCHED_MIN_RED_RATIO 1
 #define OLSCHED_INIT_RED_RATIO (1 * OLSCHED_UNIT)
-#define OLSCHED_PROBING_EPSILON (OLSCHED_UNIT >> (OLSCHED_SCALE - 10))
-#define OLSCHED_GRAD_NOISE (OLSCHED_UNIT >> (OLSCHED_SCALE - 3))
-#define OLSCHED_GRAD_STEP 1/1000
-#define OLSCHED_GRAD_MIN_STEP (OLSCHED_UNIT >> 4)
-#define OLSCHED_START_STEP (OLSCHED_UNIT >> 3)
 
 #define OLSCHED_CHANGING_THR 3
 
 /* ytxing: for utility function calculation */
-#define OLSCHED_LO_GAMMA_MAB 10 /* div by OLSCHED_GAMMA_MAB_BASE */ 
+#define OLSCHED_LO_GAMMA_MAB 20 /* div by OLSCHED_GAMMA_MAB_BASE */ 
 #define OLSCHED_HI_GAMMA_MAB 50 /* div by OLSCHED_GAMMA_MAB_BASE */ 
 #define OLSCHED_GAMMA_MAB_BASE 100
-#define OLSCHED_HI_GAMMA_DURATION 50 
+
 
 // static const u16 ol_arm_to_red_ratio[4] = {
 // 	OLSCHED_UNIT * 1,
@@ -142,10 +144,11 @@ enum OL_MON_STATE {
 /* it is to store the smoothed_arm_reward, loss rate and RTT fo a subflow in current "stable" condition */
 struct ol_monitor {
 	u64 smoothed_arm_reward[OLSCHED_ARMS_NUM]; // update like smoothed rtt
-	u64 mdev_arm_reward[OLSCHED_ARMS_NUM]; // update like smoothed rtt
+	u64 arm_reward_mdev[OLSCHED_ARMS_NUM]; // update like smoothed rtt
 	enum OL_MON_STATE state;
 	s8 changing_count[OLSCHED_ARMS_NUM]; /* exceeding OLSCHED_CHANGING_THR indicates that the model need a restart */
-	u8 hi_gamma_duration; /* how many intervals left to change to a smaller gamma? TODO not sure */
+	u16 epoch_duration; /* current epoch should not end until this becomes zero */
+	u8 hi_gamma_duration; /* how many intervals left to change to a smaller gamma? not sure */
 	u64 avg_changed_reward[OLSCHED_ARMS_NUM];
 	u8 	hi_gamma_flag:1,
 		unused:7;
@@ -274,9 +277,9 @@ static u64 ol_get_bandwidth_interval(struct ol_interval *interval, struct tcp_so
 	// if (byte_rcv == 0 && is_meta_tp(tp)){
 	// 	byte_rcv = interval->snd_seq_end - interval->snd_seq_begin;
 	// }
-	// printk(KERN_INFO "ytxing: tp:%p get bandwidth dl_bytes:%llu seq_bytes:%llu\n", tp, (interval->delivered_end - interval->delivered_begin) * mss, interval->snd_seq_end - interval->snd_seq_begin);
 	bandwidth = byte_rcv * USEC_PER_SEC;
 	do_div(bandwidth, duration); /* delivery rate, actually */
+	// printk(KERN_INFO "ytxing: tp:%p (meta_tp:%d) byte_rcv:%llu duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), byte_rcv, duration, bandwidth);
 	return bandwidth; /* Bps */
 }
 
@@ -298,26 +301,57 @@ static void ol_update_decoupled_bandwidth_interval(struct ol_gambler *gambler, s
 	ol_p->global_data->bwd_update_time = tp->tcp_mstamp;
 }
 
+/* ytxing:	update max bandwidth, e.g., the bandwidth estimated in "redundant interval" (arm_idx = 0)
+ */
+static void ol_update_max_bandwidth_interval(struct ol_gambler *gambler, struct ol_interval *interval, struct tcp_sock *tp)
+{
+	struct ol_priv *ol_p = ol_get_priv(tp);
+	u64 curr_bandwidth = ol_get_bandwidth_interval(interval, tp);
+	bool timeout = tp->tcp_mstamp > ol_p->global_data->bwd_update_time + OLSCHED_MAX_BWD_TIMEOUT;
+
+	/* detect higher bandwidth or expire, update */
+	if (curr_bandwidth > ol_p->global_data->decoupled_bandwdith || timeout){
+		ol_p->global_data->decoupled_bandwdith = curr_bandwidth;
+		ol_p->global_data->bwd_update_time = tp->tcp_mstamp;
+	}
+	gambler->force_decoupled = timeout;
+
+}
+
+/* ytxing:	update max bandwidth, e.g., the bandwidth estimated in "redundant interval" (arm_idx = 0)
+ */
+static void ol_update_bandwidth_interval(struct ol_gambler *gambler, struct ol_interval *interval, struct tcp_sock *tp)
+{
+	if (DEBUG_USE_DECOUPLED_BWD){
+		ol_update_decoupled_bandwidth_interval(gambler, interval, tp);
+	}
+	else if (DEBUG_USE_MAX_BWD){
+		ol_update_max_bandwidth_interval(gambler, interval, tp);
+	}
+	else {
+		return;
+	}
+}
 
 /* ytxing:	
  * get the loss rate of the sk, make sure this interval is COMPLETED		
  * in (0, 1) << OLSCHED_SCALE
  */
-static u64 ol_get_loss_rate(struct ol_interval *interval)
-{
-	u64 loss_rate;
-	u32 delivered;
+// static u64 ol_get_loss_rate(struct ol_interval *interval)
+// {
+// 	u64 loss_rate;
+// 	u32 delivered;
 
-	/* nothing delivered */
-	if (interval->delivered_end == interval->delivered_begin)
-		return (1 << OLSCHED_SCALE); 
+// 	/* nothing delivered */
+// 	if (interval->delivered_end == interval->delivered_begin)
+// 		return (1 << OLSCHED_SCALE); 
 
-	loss_rate = (interval->lost_end - interval->lost_begin) << OLSCHED_SCALE;
-	delivered = interval->delivered_end - interval->delivered_begin;
+// 	loss_rate = (interval->lost_end - interval->lost_begin) << OLSCHED_SCALE;
+// 	delivered = interval->delivered_end - interval->delivered_begin;
 
-	do_div(loss_rate, delivered);
-	return loss_rate;
-}
+// 	do_div(loss_rate, delivered);
+// 	return loss_rate;
+// }
 
 /* tweak the suggested ratio and setup four intervals */
 static void ol_setup_intervals_MAB(struct sock *sk, int arm_idx)
@@ -511,6 +545,12 @@ void ol_update_arm_probality(struct sock *meta_sk)
 		gamma = OLSCHED_LO_GAMMA_MAB;
 	}
 
+	if (DEBUG_USE_NEW_EPOCH) {
+		if (ol_cb->monitor->epoch_duration > 0){
+			ol_cb->monitor->epoch_duration --;
+		}
+	}
+
 	gamma_over_K = (OLSCHED_UNIT * gamma) / (OLSCHED_ARMS_NUM * OLSCHED_GAMMA_MAB_BASE);
 
 	for (i = 0; i < OLSCHED_ARMS_NUM; i++){
@@ -523,7 +563,7 @@ void ol_update_arm_probality(struct sock *meta_sk)
 		temp /= OLSCHED_GAMMA_MAB_BASE;
 		gambler->arm_probability[i] = temp + gamma_over_K;
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_probability[%d]:%u/1024 count:%u\n", meta_tp, i, gambler->arm_probability[i] >> 3, gambler->arm_count[i]);
-		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) temp:%llu gamma_over_K:%llu hi_gamma left:%u\n", meta_tp, temp >> 3, gamma_over_K >> 3, ol_cb->monitor->hi_gamma_duration);
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) temp:%llu gamma_over_K:%llu hi_gamma left:%u epoch_duration:%u\n", meta_tp, temp >> 3, gamma_over_K >> 3, ol_cb->monitor->hi_gamma_duration, ol_cb->monitor->epoch_duration);
 	}
 
 }
@@ -706,8 +746,8 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 		interval = &ol_p->intervals_data[0];
 
 
-		if (DEBUG_USE_DECOUPLED_BWD){
-			ol_update_decoupled_bandwidth_interval(gambler, interval, tp);
+		if (DEBUG_USE_DECOUPLED_BWD || DEBUG_USE_MAX_BWD){
+			ol_update_bandwidth_interval(gambler, interval, tp);
 			subflow_throughput_sum += ol_p->global_data->decoupled_bandwdith;
 		}
 		else {
@@ -724,6 +764,7 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 	return reward;
 }
 
+/* TODO if the direction of the outsiders is the same as this arm, do not reset */
 void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 {	
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
@@ -732,8 +773,15 @@ void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 	struct ol_monitor *monitor = ol_cb->monitor;
 	s64 tmp_mdev;
 	int i;
+	bool outsider = false;
+	bool is_best = true, is_worst = true;
 
 	int arm_idx = gambler->previous_arm_idx;
+
+	for (i = 0; i < OLSCHED_ARMS_NUM; i++){
+		is_best = is_best && (gambler->arm_weight[arm_idx] >= gambler->arm_weight[i]);
+		is_worst = is_worst && (gambler->arm_weight[arm_idx] <= gambler->arm_weight[i]);
+	}
 
 	if (curr_reward > OLSCHED_UNIT){
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu too large, arm:%d\n", meta_tp, curr_reward >> 3, arm_idx);
@@ -741,55 +789,70 @@ void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 	}
 
 	if (monitor->smoothed_arm_reward[arm_idx] == 0){
-		monitor->smoothed_arm_reward[arm_idx] = curr_reward;	
+		monitor->smoothed_arm_reward[arm_idx] = curr_reward;
+		monitor->arm_reward_mdev[arm_idx] = curr_reward >> 1;	
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu monitor->smoothed_arm_reward[%d]:%llu(+-%d)\n", meta_tp, curr_reward >> 3, arm_idx, monitor->smoothed_arm_reward[arm_idx] >> 3, (OLSCHED_UNIT / 3) >> 3);
 		return;
 	}
 
 	/* check different_reward */
-	if (curr_reward > monitor->smoothed_arm_reward[arm_idx] + monitor->mdev_arm_reward[arm_idx]){ /* get higher reward */
+	if ((curr_reward > monitor->smoothed_arm_reward[arm_idx] + OLSCHED_MDEV_MUL * monitor->arm_reward_mdev[arm_idx]) && !is_best){ 
+		/* get higher reward, if this arm is not the best, update */
 		if (monitor->changing_count[arm_idx] <= 0){
 			monitor->changing_count[arm_idx] = 0;
 		}
 		monitor->changing_count[arm_idx] ++;
+		outsider = true;
 	}
-
-	if (curr_reward < max_t(s64, monitor->smoothed_arm_reward[arm_idx] - monitor->mdev_arm_reward[arm_idx], 0)){ /* get lower reward */
+	else if ((curr_reward < max_t(s64, monitor->smoothed_arm_reward[arm_idx] - OLSCHED_MDEV_MUL * monitor->arm_reward_mdev[arm_idx], 0)) && !is_worst){
+		/* get lower reward, if this arm is not the worst, update  */
 		if (monitor->changing_count[arm_idx] >= 0){
 			monitor->changing_count[arm_idx] = 0;
 		}
 		monitor->changing_count[arm_idx] --;
+		outsider = true;
 	}
+	else /* in normal range, changing count set to zero*/
+	{
+		monitor->changing_count[arm_idx] = 0;
+	}
+
+	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu smoothed_arm_reward[%d]:%llu %d * arm_reward_mdev:%llu changing_count:%d\n",\
+	meta_tp, curr_reward >> 3, arm_idx, monitor->smoothed_arm_reward[arm_idx] >> 3, OLSCHED_MDEV_MUL, monitor->arm_reward_mdev[arm_idx] >> 3, monitor->changing_count[arm_idx]);
 
 	if (abs(monitor->changing_count[arm_idx]) >= OLSCHED_CHANGING_THR){
 		// monitor->state = OL_CHANGE;
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON exceed threshold changing_count:%d\n", meta_tp, monitor->changing_count[arm_idx]);
 
 		/* reset the weight of each arm */
-		if (DEBUG_USE_WEIGHT_RESET){
-			printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON reset weights\n", meta_tp);
+		if (DEBUG_USE_NEW_EPOCH && monitor->epoch_duration == 0){
+			printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON new epoch, reset weights and counts\n", meta_tp);
 			for (i = 0; i < OLSCHED_ARMS_NUM; i++){
 				gambler->arm_weight[i] = OLSCHED_UNIT;
 				gambler->arm_count[i] = 0;
+				monitor->epoch_duration = OLSCHED_EPOCH_DURATION;
 			}
 		}
-
-		/* tune gamma for a period of time TODO*/
-		if (DEBUG_USE_GAMMA_TUNING){
-			ol_cb->monitor->hi_gamma_flag = 1;
-			ol_cb->monitor->hi_gamma_duration = OLSCHED_HI_GAMMA_DURATION;
+		/* tune gamma for a period of time */
+		else if (DEBUG_USE_GAMMA_TUNING && monitor->hi_gamma_duration == 0){
+			printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON hi gamma\n", meta_tp);
+			monitor->hi_gamma_flag = 1;
+			monitor->hi_gamma_duration = OLSCHED_HI_GAMMA_DURATION;
 		}
 
 		monitor->changing_count[arm_idx] = 0;
 	}
 
-	/* always update avg reward */
+	if (outsider && monitor->epoch_duration == 0){ /* if so, do not update */
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON outsider\n", meta_tp);
+		return;
+	}
+
 	tmp_mdev = curr_reward - monitor->smoothed_arm_reward[arm_idx];
-	monitor->mdev_arm_reward[arm_idx] = monitor->mdev_arm_reward[arm_idx] - (monitor->mdev_arm_reward[arm_idx] >> 2) + (abs(tmp_mdev) >> 2);
+	monitor->arm_reward_mdev[arm_idx] = monitor->arm_reward_mdev[arm_idx] - (monitor->arm_reward_mdev[arm_idx] >> 3) + (abs(tmp_mdev) >> 3);
 	monitor->smoothed_arm_reward[arm_idx] = monitor->smoothed_arm_reward[arm_idx] - (monitor->smoothed_arm_reward[arm_idx] >> 3) + (curr_reward >> 3);
 
 
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu smoothed_arm_reward[%d]:%llu mdev_arm_reward:%llu)\n", meta_tp, curr_reward >> 3, arm_idx, monitor->smoothed_arm_reward[arm_idx] >> 3, monitor->mdev_arm_reward[arm_idx] >> 3);
 
 	return;
 }
@@ -845,7 +908,7 @@ static void ol_exp3_update(struct sock *meta_sk)
 		/********************************************\
 		 * in Exp3, arm_weight will exponential grow *
 		 * and all arm_weight needs to be shrinked   *
-		 * sometime.								 *
+		 * sometime.                                 *
 		\********************************************/
 		for (i = 0; i < OLSCHED_ARMS_NUM; i++){
 			gambler->arm_weight[i] = max_t(u64, OLSCHED_UNIT, gambler->arm_weight[i] >> 8);
@@ -1495,9 +1558,10 @@ static void ol_init(struct sock *sk)
 	ol_cb->monitor->state = OL_CHANGE;
 	for (i = 0; i < OLSCHED_INTERVALS_NUM; i++){
 		ol_cb->monitor->smoothed_arm_reward[i] = 0;
-		ol_cb->monitor->mdev_arm_reward[i] = 0;
+		ol_cb->monitor->arm_reward_mdev[i] = 0;
 		ol_cb->monitor->avg_changed_reward[i] = 0;
 		ol_cb->monitor->changing_count[i] = 0;
+		ol_cb->monitor->epoch_duration = OLSCHED_EPOCH_DURATION;
 		ol_cb->monitor->hi_gamma_flag = 1;
 		ol_cb->monitor->hi_gamma_duration = OLSCHED_HI_GAMMA_DURATION;
 	}
@@ -1511,6 +1575,7 @@ static void ol_init(struct sock *sk)
 
 
 	printk(KERN_DEBUG "ytxing: ol_init tp:%p\n", tcp_sk(sk));
+	printk(KERN_DEBUG "ytxing: tp:%p DEBUG_USE_NEW_EPOCH:%d DEBUG_USE_GAMMA_TUNING:%d\n", tcp_sk(sk), DEBUG_USE_NEW_EPOCH, DEBUG_USE_GAMMA_TUNING);
 	// if(!tcp_is_sack(tcp_sk(sk)))
 	// 	printk(KERN_DEBUG "ytxing: ol_init tp:%p is not sack, maybe bad.\n", tcp_sk(sk));
 }
@@ -1545,5 +1610,5 @@ module_exit(ol_unregister);
 
 MODULE_AUTHOR("Yitao Xing");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("OL MPTCP");
-MODULE_VERSION("0.01");
+MODULE_DESCRIPTION("An Online-Learning-Asisted Packet Scheduler(OLAPS) for MPTCP");
+MODULE_VERSION("0.11");
