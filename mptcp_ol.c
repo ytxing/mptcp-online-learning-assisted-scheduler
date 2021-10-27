@@ -830,8 +830,9 @@ void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 			for (i = 0; i < OLSCHED_ARMS_NUM; i++){
 				gambler->arm_weight[i] = OLSCHED_UNIT;
 				gambler->arm_count[i] = 0;
-				monitor->epoch_duration = OLSCHED_EPOCH_DURATION;
+				monitor->smoothed_arm_reward[i] = 0; /* reset the smoothed_arm_reward */
 			}
+			monitor->epoch_duration = OLSCHED_EPOCH_DURATION;
 		}
 		/* tune gamma for a period of time */
 		else if (DEBUG_USE_GAMMA_TUNING && monitor->hi_gamma_duration == 0){
