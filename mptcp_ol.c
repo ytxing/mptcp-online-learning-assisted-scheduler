@@ -78,8 +78,9 @@ typedef __s64 s64;
 // 	OLSCHED_UNIT * 1 / 3,
 // 	OLSCHED_MIN_RED_RATIO
 // };
-static const u16 ol_arm_to_red_ratio[2] = {
+static const u16 ol_arm_to_red_ratio[3] = {
 	OLSCHED_UNIT * 1,
+	OLSCHED_UNIT * 1 / 2,
 	OLSCHED_MIN_RED_RATIO
 };
 #define OLSCHED_ARMS_NUM sizeof(ol_arm_to_red_ratio)/sizeof(ol_arm_to_red_ratio[0])
@@ -1396,7 +1397,9 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 	active_valid_sks = ol_get_active_valid_sks_num(meta_sk);
 	
 	/* process ol model immediately, since sending nothing doesn't mean receiving nothing */
+	if (active_valid_sks >= 2){
 	ol_process_all_subflows(meta_sk, &new_interval_started);
+	}
 	
 
 	/* As we set it, we have to reset it as well. */
