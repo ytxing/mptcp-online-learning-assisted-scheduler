@@ -35,12 +35,8 @@ typedef __s64 s64;
 #define DEBUG_USE_DECOUPLED_BWD false
 #define DEBUG_USE_MAX_BWD true
 #define DEBUG_USE_NEW_EPOCH true
-#define DEBUG_USE_GAMMA_TUNING false
-
-/* new epoch or gamma */
-#define OLSCHED_EPOCH_DURATION 100
-#define OLSCHED_HI_GAMMA_DURATION 50 
-#define OLSCHED_MDEV_MUL 3
+#define DEBUG_USE_GAMMA_TUNING true
+#define DEBUG_USE_FORCE_DECOUPLE false
 
 #define OLSCHED_INTERVALS_NUM 1
 #define OLSCHED_INTERVALS_MIN_DURATION 100 * USEC_PER_MSEC /* minimal duration(us) */
@@ -83,7 +79,16 @@ static const u16 ol_arm_to_red_ratio[3] = {
 	OLSCHED_UNIT * 1 / 2,
 	OLSCHED_MIN_RED_RATIO
 };
+// static const u16 ol_arm_to_red_ratio[2] = {
+// 	OLSCHED_UNIT * 1,
+// 	OLSCHED_MIN_RED_RATIO
+// };
 #define OLSCHED_ARMS_NUM sizeof(ol_arm_to_red_ratio)/sizeof(ol_arm_to_red_ratio[0])
+
+/* new epoch or gamma */
+#define OLSCHED_EPOCH_DURATION OLSCHED_ARMS_NUM * 20
+#define OLSCHED_HI_GAMMA_DURATION OLSCHED_ARMS_NUM * 20 
+#define OLSCHED_MDEV_MUL 3
 
 /* Scale factor for rate in pkt/uSec unit to avoid truncation in bandwidth
  * estimation. The rate unit ~= (1500 bytes / 1 usec / 2^24) ~= 715 bps.
@@ -584,7 +589,7 @@ u8 pull_the_arm_accordingly(struct sock *meta_sk)
 	}
 
 	/* if we need to decouple subflows to estimate bandwidth of them */
-	if (gambler->force_decoupled){
+	if (DEBUG_USE_FORCE_DECOUPLE && gambler->force_decoupled){
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) force_decoupled\n", meta_tp);
 		gambler->force_decoupled = false;
 		gambler->current_arm_idx = 0;
@@ -836,10 +841,10 @@ void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 			monitor->epoch_duration = OLSCHED_EPOCH_DURATION;
 		}
 		/* tune gamma for a period of time */
-		else if (DEBUG_USE_GAMMA_TUNING && monitor->hi_gamma_duration == 0){
+		if (DEBUG_USE_GAMMA_TUNING && monitor->hi_gamma_duration == 0){
 			printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON hi gamma\n", meta_tp);
 			monitor->hi_gamma_flag = 1;
-			monitor->hi_gamma_duration = OLSCHED_HI_GAMMA_DURATION;
+			monitor->hi_gamma_duration = OLSCHED_EPOCH_DURATION; // try
 		}
 
 		monitor->changing_count[arm_idx] = 0;
@@ -1567,7 +1572,7 @@ static void ol_init(struct sock *sk)
 		ol_cb->monitor->changing_count[i] = 0;
 		ol_cb->monitor->epoch_duration = OLSCHED_EPOCH_DURATION;
 		ol_cb->monitor->hi_gamma_flag = 1;
-		ol_cb->monitor->hi_gamma_duration = OLSCHED_HI_GAMMA_DURATION;
+		ol_cb->monitor->hi_gamma_duration = OLSCHED_EPOCH_DURATION;
 	}
 
 	ol_p->global_data->init = 1;
