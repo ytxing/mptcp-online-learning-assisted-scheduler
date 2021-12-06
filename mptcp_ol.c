@@ -21,6 +21,8 @@
 #include <net/mptcp.h>
 
 #include <linux/random.h>
+#include <linux/sort.h>
+
 
 /* ytxing: yue */
 typedef __u8 u8;
@@ -56,7 +58,7 @@ MODULE_PARM_DESC(DEBUG_USE_GAMMA_TUNING, "use reward monitor?");	/*模块参数�
 /* ytxing:
  * tried 3/2, it seems that longer duration is better.
  */
-#define OLSCHED_INTERVALS_DURATION_N_RTT 3 /* n * RTT */
+#define OLSCHED_INTERVALS_DURATION_N_RTT 5/2 /* n * RTT */
 #define OLSCHED_INTERVALS_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 3
 #define OLSCHED_DCP_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 30 /* a timeout for decoupled bandwidth */
 #define OLSCHED_MAX_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 30 /* a timeout for decoupled bandwidth */
@@ -152,6 +154,7 @@ struct ol_interval {
 	u32	snd_seq_begin;
 	u32	snd_seq_end;
 	u32 delivered_begin; 	/*pkts*/
+	u32 sacked_begin;
 	u32 lost_begin; 		/*pkts*/
 
 	/* status for receiving state */
@@ -159,6 +162,7 @@ struct ol_interval {
 	u64	rcv_time_end;
 	u32 known_seq;			/* known send sequence (through (s)ack) */
 	u32 delivered_end; 		/*pkts*/
+	u32 sacked_end;
 	u32 lost_end; 			/*pkts*/
 	u32 lost_bytes;
 
@@ -466,8 +470,9 @@ bool ol_all_subflow_send_interval_ended(struct tcp_sock *meta_tp)
 			// u32 interval_duration = interval->interval_duration;
 
 			interval->snd_ended = true;
-			// printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END packets_sent:%u bytes:%u\n", tp, is_meta_tp(tp), interval->index, packets_sent, interval->snd_seq_end - interval->snd_seq_begin);
-			// printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END snd_duration:%llu interval_duration:%u\n", tp, is_meta_tp(tp), interval->index, interval->snd_time_end - interval->snd_time_begin, interval_duration);
+			printk(KERN_INFO "ytxing: tp:%p (meta:%d) SND END bytes:%u snd_dur:%llu interval_dur:%u\n",\
+			tp, is_meta_tp(tp), interval->snd_seq_end - interval->snd_seq_begin, interval->snd_time_end - interval->snd_time_begin, interval->interval_duration);
+
 		}
 
 	}
@@ -597,7 +602,7 @@ void ol_update_arm_probality(struct sock *meta_sk)
 		temp *= OLSCHED_GAMMA_MAB_BASE - gamma;
 		temp /= OLSCHED_GAMMA_MAB_BASE;
 		gambler->arm_probability[i] = temp + gamma_over_K;
-		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_probability[%d]:%u/1024 count:%u\n", meta_tp, i, gambler->arm_probability[i] >> 3, gambler->arm_count[i]);
+		// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_probability[%d]:%u/1024 count:%u\n", meta_tp, i, gambler->arm_probability[i] >> 3, gambler->arm_count[i]);
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) temp:%llu gamma_over_K:%llu hi_gamma left:%u epoch_duration:%u\n", meta_tp, temp >> 3, gamma_over_K >> 3, ol_cb->monitor->hi_gamma_duration, ol_cb->monitor->epoch_duration);
 	}
 
@@ -644,24 +649,47 @@ u8 pull_the_arm_accordingly(struct sock *meta_sk)
 	return arm_idx;
 }
 
-u8 pull_the_arm_with_hi_probability(struct sock *sk)
+u8 pull_the_arm_randomly(struct sock *meta_sk)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct ol_cb *ol_cb = ol_get_cb(tp);
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
+	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 	struct ol_gambler *gambler = ol_cb->gambler;
 	// struct ol_global *global = ol_p->global_data;
-	int arm_idx, hi_arm_idx;
-	u16 hi_probability = 0;
+	int arm_idx, arm_num = OLSCHED_ARMS_NUM;
+	u16 random, probability_cumulated, random_mask;
 
-	for (arm_idx = 0; arm_idx < OLSCHED_ARMS_NUM; arm_idx++){
-		if (gambler->arm_probability[arm_idx] > hi_probability){
-			hi_probability = gambler->arm_probability[arm_idx];
-			hi_arm_idx = arm_idx;
-		}
+	if (DEBUG_FIX_ARM){
+		gambler->current_arm_idx = DEBUG_FIXED_ARM_IDX;
+		return DEBUG_FIXED_ARM_IDX;
 	}
 
+	/* if we need to decouple subflows to estimate bandwidth of them */
+	if (DEBUG_USE_FORCE_DECOUPLE && gambler->force_decoupled){
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) force_decoupled\n", meta_tp);
+		gambler->force_decoupled = false;
+		gambler->current_arm_idx = 0;
+		return 0;
+	}
+
+	probability_cumulated = 0; 
+	random_mask = OLSCHED_UNIT - 1;
+	get_random_bytes(&random, sizeof(random));
+	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) random:%x random_mask:%x random:%x\n", meta_tp, random, random_mask, random & random_mask);
+	random = random & random_mask;
+	if (random > OLSCHED_UNIT)
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) BUG random > OLSCHED_UNIT\n", meta_tp);
+
+	for (arm_idx = 0; arm_idx < OLSCHED_ARMS_NUM; arm_idx++){
+		probability_cumulated += OLSCHED_UNIT / arm_num;
+		if (random <= probability_cumulated){
+			break;
+		}
+	}
+	gambler->current_arm_idx = arm_idx;
+	gambler->arm_count[arm_idx] ++;
 	return arm_idx;
 }
+
 
 static void update_interval_info_snd(struct ol_interval *interval, struct tcp_sock *tp)
 {
@@ -696,18 +724,20 @@ static void update_interval_info_rcv(struct ol_interval *interval, struct tcp_so
 	/* ytxing: if this interval just start receiving pkts for the first time */
 	if (!after(current_interval_known_seq, interval->snd_seq_begin) && after(interval->known_seq, interval->snd_seq_begin)) {
 		interval->delivered_begin = tp->delivered;
+		interval->sacked_begin = tp->sacked_out;
 		interval->lost_begin = tp->lost;
 		interval->rcv_time_begin = tp->tcp_mstamp;
 	}
 	/* ytxing: if the interval has seen all sent packets and finished sending */
 	if (interval->snd_ended && before(current_interval_known_seq, interval->snd_seq_end) && !before(interval->known_seq, interval->snd_seq_end)) {
 		interval->delivered_end = tp->delivered;
+		interval->sacked_end = tp->sacked_out;
 		interval->lost_end = tp->lost;
 		interval->rcv_time_end = tp->tcp_mstamp;
 		if (interval->snd_ended){
 			interval->rcv_ended = true;
-			printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u lost:%u bytes:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3);
-			printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
+			printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) RCV END bytes:%u srtt(us):%u all_dur:%llu bwd:%llu\n", tp, is_meta_tp(tp), interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
+			printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) RCV END sacked:%u sackedB:%u 323%u\n", tp, is_meta_tp(tp), interval->sacked_end - interval->sacked_begin, (interval->sacked_end - interval->sacked_begin) * 1428, tp->sacked_out);
 		}
 
 		return;
@@ -828,8 +858,17 @@ void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 
 	if (monitor->smoothed_arm_reward[arm_idx] == 0){
 		monitor->smoothed_arm_reward[arm_idx] = curr_reward;
-		monitor->arm_reward_mdev[arm_idx] = curr_reward >> 1;	
-		// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu monitor->smoothed_arm_reward[%d]:%llu(+-%d)\n", meta_tp, curr_reward >> 3, arm_idx, monitor->smoothed_arm_reward[arm_idx] >> 3, (OLSCHED_UNIT / 3) >> 3);
+		monitor->arm_reward_mdev[arm_idx] = 0;	
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu smoothed_arm_reward[%d]:%llu %d * arm_reward_mdev:%llu changing_count:%d\n",\
+		meta_tp, curr_reward >> 3, arm_idx, monitor->smoothed_arm_reward[arm_idx] >> 3, OLSCHED_MDEV_MUL, monitor->arm_reward_mdev[arm_idx] >> 3, monitor->changing_count[arm_idx]);
+		return;
+	}
+	if (monitor->arm_reward_mdev[arm_idx] == 0){
+		tmp_mdev = curr_reward - monitor->smoothed_arm_reward[arm_idx];
+		monitor->arm_reward_mdev[arm_idx] = tmp_mdev;
+		monitor->smoothed_arm_reward[arm_idx] = monitor->smoothed_arm_reward[arm_idx] - (monitor->smoothed_arm_reward[arm_idx] >> 3) + (curr_reward >> 3);
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu smoothed_arm_reward[%d]:%llu %d * arm_reward_mdev:%llu changing_count:%d\n",\
+		meta_tp, curr_reward >> 3, arm_idx, monitor->smoothed_arm_reward[arm_idx] >> 3, OLSCHED_MDEV_MUL, monitor->arm_reward_mdev[arm_idx] >> 3, monitor->changing_count[arm_idx]);
 		return;
 	}
 
@@ -891,10 +930,38 @@ void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 	monitor->arm_reward_mdev[arm_idx] = monitor->arm_reward_mdev[arm_idx] - (monitor->arm_reward_mdev[arm_idx] >> 3) + (abs(tmp_mdev) >> 3);
 	monitor->smoothed_arm_reward[arm_idx] = monitor->smoothed_arm_reward[arm_idx] - (monitor->smoothed_arm_reward[arm_idx] >> 3) + (curr_reward >> 3);
 
-
-
 	return;
 }
+
+// /* TODO if the direction of the outsiders is the same as this arm, do not reset */
+// void ol_weight_mismatches_reward(struct sock *meta_sk)
+// {	
+// 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
+// 	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
+// 	struct ol_gambler *gambler = ol_cb->gambler;
+// 	struct ol_monitor *monitor = ol_cb->monitor;
+// 	int weight_ranking[OLSCHED_ARMS_NUM];
+// 	int srwd_ranking[OLSCHED_ARMS_NUM];
+// 	int i, j, curr_ranking;
+
+// 	for (i = 1; i < OLSCHED_ARMS_NUM; i++){
+// 		weight_ranking[i] = i;
+// 		srwd_ranking[i] = i;
+// 	}
+
+// 	int max_idx = 0;
+// 	u64 max_weight = gambler->arm_weight[0];
+// 	u64 cap = -1;
+
+// 	curr_ranking = 0;
+// 	for (i = 1; i < OLSCHED_ARMS_NUM; i++){
+// 		if (gambler->arm_weight[i] > max_weight && gambler->arm_weight[i] < cap){
+// 			max_idx = i;
+// 			max_weight = gambler->arm_weight[i];
+// 		}
+// 	}
+// 	return;
+// }
 
 /* The Exp3 Algorithm: 
  * 1. set arm probability according to arm weight
@@ -912,7 +979,7 @@ static void ol_exp3_update(struct sock *meta_sk)
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 	struct ol_gambler *gambler = ol_cb->gambler;
-	// struct ol_monitor *monitor = ol_cb->monitor;
+	struct ol_monitor *monitor = ol_cb->monitor;
 	u64 reward, exp_reward;
 	u64 temp;
 	int i;
@@ -924,6 +991,8 @@ static void ol_exp3_update(struct sock *meta_sk)
 	reward = ol_calc_reward(meta_sk); // reward << OLSCHED_SCALE, actually. Since 0 < reward <= 1. 
 	
 	ol_check_reward_difference(reward, meta_sk);
+	// reward = monitor->smoothed_arm_reward[gambler->previous_arm_idx];
+	// ol_weight_mismatches_reward(meta_sk);
 
 	// check_avg_reward(reward, gambler, monitor);
 
@@ -959,7 +1028,7 @@ static void ol_exp3_update(struct sock *meta_sk)
 
 
 	/* Since arm_weight is stored in OLSCHED_UNIT, *= will multiply it to OLSCHED_UNIT^2 */
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_weight[%d]:%llu\n", meta_tp, gambler->previous_arm_idx, gambler->arm_weight[gambler->previous_arm_idx]);
+	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_weight[%d]:%llu\n", meta_tp, gambler->previous_arm_idx, gambler->arm_weight[gambler->previous_arm_idx]);
 
 	/* update the probility of previous arm accordingly */
 	ol_update_arm_probality(meta_sk);
@@ -1034,10 +1103,9 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 			interval_duration = meta_interval->interval_duration;
 
 			meta_interval->snd_ended = true;
-			// printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END packets_sent:%u bytes:%u\n",\
-			// 	meta_tp, is_meta_tp(meta_tp), meta_interval->index, packets_sent, meta_interval->snd_seq_end - meta_interval->snd_seq_begin);
-			// printk(KERN_INFO "ytxing: tp:%p (meta:%d) idx:%d SND END actual_duration:%llu interval_duration:%u\n",\
-			// 	meta_tp, is_meta_tp(meta_tp), meta_interval->index, meta_interval->snd_time_end - meta_interval->snd_time_begin, interval_duration);
+			printk(KERN_INFO "ytxing: tp:%p (meta:%d) SND END bytes:%u snd_dur:%llu interval_dur:%u\n",\
+				meta_tp, is_meta_tp(meta_tp), meta_interval->snd_seq_end - meta_interval->snd_seq_begin, meta_interval->snd_time_end - meta_interval->snd_time_begin, interval_duration);
+
 		}
 	}
 	
@@ -1084,7 +1152,8 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 	
 
 	/* pull an arm for all subflows */
-	arm_idx = pull_the_arm_accordingly(meta_sk);
+	// arm_idx = pull_the_arm_accordingly(meta_sk);
+	arm_idx = pull_the_arm_randomly(meta_sk);
 	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) pulling arm_idx:%u red_ratio:%u\n", meta_tp, arm_idx, ol_arm_to_red_ratio[arm_idx] >> 3);
 
 	/* setup interval for all subflows */
