@@ -30,16 +30,28 @@ typedef __s8 s8;
 typedef __s32 s32;
 typedef __s64 s64;
 
-#define DEBUG_FIX_ARM false
-#define DEBUG_FIXED_ARM_IDX 0
+static bool DEBUG_FIX_ARM __read_mostly = false; 
+module_param(DEBUG_FIX_ARM, bool, 0644);	/*模块参数类型，权限*/
+MODULE_PARM_DESC(DEBUG_FIX_ARM, "fix the arm");	/*模块参数说明*/
+static int DEBUG_FIXED_ARM_IDX __read_mostly = 2; 
+module_param(DEBUG_FIXED_ARM_IDX, int, 0644);	/*模块参数类型，权限*/
+MODULE_PARM_DESC(DEBUG_FIXED_ARM_IDX, "fix the arm idx");	/*模块参数说明*/
+// #define DEBUG_FIX_ARM true //move to kernel para
+// #define DEBUG_FIXED_ARM_IDX 2 //move to kernel para
 #define DEBUG_USE_DECOUPLED_BWD false
 #define DEBUG_USE_MAX_BWD true
-#define DEBUG_USE_NEW_EPOCH true
-#define DEBUG_USE_GAMMA_TUNING true
+static bool DEBUG_USE_NEW_EPOCH __read_mostly = true; 
+module_param(DEBUG_USE_NEW_EPOCH, bool, 0644);	/*模块参数类型，权限*/
+MODULE_PARM_DESC(DEBUG_USE_NEW_EPOCH, "use reward monitor?");	/*模块参数说明*/
+// #define DEBUG_USE_NEW_EPOCH true
+static bool DEBUG_USE_GAMMA_TUNING __read_mostly = true; 
+module_param(DEBUG_USE_GAMMA_TUNING, bool, 0644);	/*模块参数类型，权限*/
+MODULE_PARM_DESC(DEBUG_USE_GAMMA_TUNING, "use reward monitor?");	/*模块参数说明*/
+// #define DEBUG_USE_GAMMA_TUNING true
 #define DEBUG_USE_FORCE_DECOUPLE false
 
 #define OLSCHED_INTERVALS_NUM 1
-#define OLSCHED_INTERVALS_MIN_DURATION 100 * USEC_PER_MSEC /* minimal duration(us) */
+#define OLSCHED_INTERVALS_MIN_DURATION 20 * USEC_PER_MSEC /* minimal duration(us) */
 
 /* ytxing:
  * tried 3/2, it seems that longer duration is better.
@@ -60,12 +72,18 @@ typedef __s64 s64;
 #define OLSCHED_MIN_RED_RATIO 1
 #define OLSCHED_INIT_RED_RATIO (1 * OLSCHED_UNIT)
 
-#define OLSCHED_CHANGING_THR 3
 
 /* ytxing: for utility function calculation */
-#define OLSCHED_LO_GAMMA_MAB 20 /* div by OLSCHED_GAMMA_MAB_BASE */ 
-#define OLSCHED_HI_GAMMA_MAB 50 /* div by OLSCHED_GAMMA_MAB_BASE */ 
+static int OLSCHED_LO_GAMMA_MAB __read_mostly = 20; 
+module_param(OLSCHED_LO_GAMMA_MAB, int, 0644);	/*模块参数类型，权限*/
+MODULE_PARM_DESC(OLSCHED_LO_GAMMA_MAB, "OLSCHED_LO_GAMMA_MAB");	/*模块参数说明*/
+// #define OLSCHED_LO_GAMMA_MAB 30 /* div by OLSCHED_GAMMA_MAB_BASE */ 
+static int OLSCHED_HI_GAMMA_MAB __read_mostly = 50; 
+module_param(OLSCHED_HI_GAMMA_MAB, int, 0644);	/*模块参数类型，权限*/
+MODULE_PARM_DESC(OLSCHED_HI_GAMMA_MAB, "OLSCHED_HI_GAMMA_MAB");	/*模块参数说明*/
+// #define OLSCHED_HI_GAMMA_MAB 60 /* div by OLSCHED_GAMMA_MAB_BASE */ 
 #define OLSCHED_GAMMA_MAB_BASE 100
+
 
 
 // static const u16 ol_arm_to_red_ratio[4] = {
@@ -86,9 +104,20 @@ static const u16 ol_arm_to_red_ratio[3] = {
 #define OLSCHED_ARMS_NUM sizeof(ol_arm_to_red_ratio)/sizeof(ol_arm_to_red_ratio[0])
 
 /* new epoch or gamma */
-#define OLSCHED_EPOCH_DURATION OLSCHED_ARMS_NUM * 20
-#define OLSCHED_HI_GAMMA_DURATION OLSCHED_ARMS_NUM * 20 
-#define OLSCHED_MDEV_MUL 3
+static int OLSCHED_EPOCH_DURATION_PER_ARM __read_mostly = 25; 
+module_param(OLSCHED_EPOCH_DURATION_PER_ARM, int, 0644);	/*模块参数类型，权限*/
+MODULE_PARM_DESC(OLSCHED_EPOCH_DURATION_PER_ARM, "OLSCHED_EPOCH_DURATION_PER_ARM");	/*模块参数说明*/
+#define OLSCHED_EPOCH_DURATION OLSCHED_ARMS_NUM * OLSCHED_EPOCH_DURATION_PER_ARM
+#define OLSCHED_HI_GAMMA_DURATION OLSCHED_ARMS_NUM * OLSCHED_EPOCH_DURATION_PER_ARM
+
+static int OLSCHED_MDEV_MUL_UP __read_mostly = 30; 
+module_param(OLSCHED_MDEV_MUL_UP, int, 0644);	/*模块参数类型，权限*/
+MODULE_PARM_DESC(OLSCHED_MDEV_MUL_UP, "mul");	/*模块参数说明*/
+#define OLSCHED_MDEV_MUL OLSCHED_MDEV_MUL_UP/10
+static int OLSCHED_CHANGING_THR __read_mostly = 4; 
+module_param(OLSCHED_CHANGING_THR, int, 0644);	/*模块参数类型，权限*/
+MODULE_PARM_DESC(OLSCHED_CHANGING_THR, "thr");	/*模块参数说明*/
+// #define OLSCHED_CHANGING_THR 4
 
 /* Scale factor for rate in pkt/uSec unit to avoid truncation in bandwidth
  * estimation. The rate unit ~= (1500 bytes / 1 usec / 2^24) ~= 715 bps.
@@ -518,7 +547,7 @@ void start_current_send_interval(struct tcp_sock *tp)
 	interval->snd_end_ready = false;
 	interval->rcv_ended = false;
 	if (is_meta_tp(tp)){
-		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) start interval snd_idx: %u\n", tp, interval->index);
+		// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) start interval snd_idx: %u\n", tp, interval->index);
 		return;
 	}
 	
@@ -675,9 +704,12 @@ static void update_interval_info_rcv(struct ol_interval *interval, struct tcp_so
 		interval->delivered_end = tp->delivered;
 		interval->lost_end = tp->lost;
 		interval->rcv_time_end = tp->tcp_mstamp;
-		interval->rcv_ended = true;
-		// printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u lost:%u bytes:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3);
-		// printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
+		if (interval->snd_ended){
+			interval->rcv_ended = true;
+			printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END delivered:%u lost:%u bytes:%u srtt:%u\n", tp, is_meta_tp(tp), interval->index, interval->delivered_end - interval->delivered_begin, interval->lost_end - interval->lost_begin, interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3);
+			printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) idx:%u RCV END all_duration:%llu bandwidth:%llu\n", tp, is_meta_tp(tp), interval->index, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
+		}
+
 		return;
 	}
 	/* ytxing: something wrong here */
@@ -766,7 +798,7 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 		return 0;
 	reward = meta_throughput * OLSCHED_UNIT;
 	do_div(reward, subflow_throughput_sum);
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm:%d reward:%llu/1024\n", meta_tp, gambler->previous_arm_idx, reward >> 3);
+	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm:%d reward:%llu/1024\n", meta_tp, gambler->previous_arm_idx, reward >> 3);
 	return reward;
 }
 
@@ -790,19 +822,19 @@ void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 	}
 
 	if (curr_reward > OLSCHED_UNIT){
-		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu too large, arm:%d\n", meta_tp, curr_reward >> 3, arm_idx);
+		// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu too large, arm:%d\n", meta_tp, curr_reward >> 3, arm_idx);
 		curr_reward = OLSCHED_UNIT;
 	}
 
 	if (monitor->smoothed_arm_reward[arm_idx] == 0){
 		monitor->smoothed_arm_reward[arm_idx] = curr_reward;
 		monitor->arm_reward_mdev[arm_idx] = curr_reward >> 1;	
-		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu monitor->smoothed_arm_reward[%d]:%llu(+-%d)\n", meta_tp, curr_reward >> 3, arm_idx, monitor->smoothed_arm_reward[arm_idx] >> 3, (OLSCHED_UNIT / 3) >> 3);
+		// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu monitor->smoothed_arm_reward[%d]:%llu(+-%d)\n", meta_tp, curr_reward >> 3, arm_idx, monitor->smoothed_arm_reward[arm_idx] >> 3, (OLSCHED_UNIT / 3) >> 3);
 		return;
 	}
 
 	/* check different_reward */
-	if ((curr_reward > monitor->smoothed_arm_reward[arm_idx] + OLSCHED_MDEV_MUL * monitor->arm_reward_mdev[arm_idx]) && !is_best){ 
+	if ((curr_reward > monitor->smoothed_arm_reward[arm_idx] +  monitor->arm_reward_mdev[arm_idx] * OLSCHED_MDEV_MUL) && !is_best){ 
 		/* get higher reward, if this arm is not the best, update */
 		if (monitor->changing_count[arm_idx] <= 0){
 			monitor->changing_count[arm_idx] = 0;
@@ -810,7 +842,7 @@ void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 		monitor->changing_count[arm_idx] ++;
 		outsider = true;
 	}
-	else if ((curr_reward < max_t(s64, monitor->smoothed_arm_reward[arm_idx] - OLSCHED_MDEV_MUL * monitor->arm_reward_mdev[arm_idx], 0)) && !is_worst){
+	else if ((curr_reward < max_t(s64, monitor->smoothed_arm_reward[arm_idx] - monitor->arm_reward_mdev[arm_idx] * OLSCHED_MDEV_MUL, 0)) && !is_worst){
 		/* get lower reward, if this arm is not the worst, update  */
 		if (monitor->changing_count[arm_idx] >= 0){
 			monitor->changing_count[arm_idx] = 0;
@@ -971,7 +1003,6 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 		tp = tcp_sk(sk);
 		ol_p = ol_get_priv(tp);
 		interval = &ol_p->intervals_data[0];
-		global = ol_p->global_data;
 
 		if (mptcp_is_def_unavailable(sk)){
 			continue;
@@ -987,8 +1018,8 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 		}
 
 		/* RCV INFO */
-		if (interval->rcv_ended == false)
-			update_interval_info_rcv(interval, tp);
+		// if (interval->rcv_ended == false)
+		// 	update_interval_info_rcv(interval, tp);
 	}
 
 	/* SND INFO META */
@@ -1010,6 +1041,31 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 		}
 	}
 	
+	mptcp_for_each_sub(mpcb, mptcp) {
+		
+		sk = mptcp_to_sock(mptcp);
+		tp = tcp_sk(sk);
+		ol_p = ol_get_priv(tp);
+		interval = &ol_p->intervals_data[0];
+
+		if (mptcp_is_def_unavailable(sk)){
+			continue;
+		}
+		if (!ol_valid(ol_p)){
+			continue;
+		}
+		
+		// /* SND INFO */
+		// if (meta_interval->snd_ended == false){
+		// 	update_interval_info_snd(interval, tp);
+		// 	ol_current_send_interval_end_ready(interval, tp);
+		// }
+
+		/* RCV INFO */
+		if (interval->rcv_ended == false)
+			update_interval_info_rcv(interval, tp);
+	}
+
 	/* RCV INFO META */
 	update_interval_info_rcv(meta_interval, meta_tp);
 	if (!is_all_receive_interval_ended(meta_sk)){
@@ -1029,7 +1085,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 
 	/* pull an arm for all subflows */
 	arm_idx = pull_the_arm_accordingly(meta_sk);
-	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) pulling arm_idx:%u red_ratio:%u\n", meta_tp, arm_idx, ol_arm_to_red_ratio[arm_idx] >> 3);
+	// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) pulling arm_idx:%u red_ratio:%u\n", meta_tp, arm_idx, ol_arm_to_red_ratio[arm_idx] >> 3);
 
 	/* setup interval for all subflows */
 	mptcp_for_each_sub(mpcb, mptcp) {
