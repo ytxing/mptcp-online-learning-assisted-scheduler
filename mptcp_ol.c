@@ -154,7 +154,7 @@ struct ol_interval {
 	u32	snd_seq_begin;
 	u32	snd_seq_end;
 	u32 delivered_begin; 	/*pkts*/
-	u32 sacked_begin;
+	u32 debug1_begin;
 	u32 lost_begin; 		/*pkts*/
 
 	/* status for receiving state */
@@ -162,7 +162,7 @@ struct ol_interval {
 	u64	rcv_time_end;
 	u32 known_seq;			/* known send sequence (through (s)ack) */
 	u32 delivered_end; 		/*pkts*/
-	u32 sacked_end;
+	u32 debug1_end;
 	u32 lost_end; 			/*pkts*/
 	u32 lost_bytes;
 
@@ -724,20 +724,17 @@ static void update_interval_info_rcv(struct ol_interval *interval, struct tcp_so
 	/* ytxing: if this interval just start receiving pkts for the first time */
 	if (!after(current_interval_known_seq, interval->snd_seq_begin) && after(interval->known_seq, interval->snd_seq_begin)) {
 		interval->delivered_begin = tp->delivered;
-		interval->sacked_begin = tp->sacked_out;
 		interval->lost_begin = tp->lost;
 		interval->rcv_time_begin = tp->tcp_mstamp;
 	}
 	/* ytxing: if the interval has seen all sent packets and finished sending */
 	if (interval->snd_ended && before(current_interval_known_seq, interval->snd_seq_end) && !before(interval->known_seq, interval->snd_seq_end)) {
 		interval->delivered_end = tp->delivered;
-		interval->sacked_end = tp->sacked_out;
 		interval->lost_end = tp->lost;
 		interval->rcv_time_end = tp->tcp_mstamp;
 		if (interval->snd_ended){
 			interval->rcv_ended = true;
-			printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) RCV END bytes:%u srtt(us):%u all_dur:%llu bwd:%llu\n", tp, is_meta_tp(tp), interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
-			printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) RCV END sacked:%u sackedB:%u 323%u\n", tp, is_meta_tp(tp), interval->sacked_end - interval->sacked_begin, (interval->sacked_end - interval->sacked_begin) * 1428, tp->sacked_out);
+			// printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) RCV END bytes:%u srtt(us):%u all_dur:%llu bwd:%llu\n", tp, is_meta_tp(tp), interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
 		}
 
 		return;
@@ -1346,9 +1343,6 @@ static struct sock *get_shorter_rtt_subflow_with_selector(struct mptcp_cb *mpcb,
 
 	return bettersk;
 }
-
-
-
 
 /* Returns the next skb from the queue */
 static struct sk_buff *ol_next_skb_from_queue(struct sk_buff_head *queue,
