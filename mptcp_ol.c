@@ -372,26 +372,6 @@ static void ol_update_bandwidth_interval(struct ol_gambler *gambler, struct ol_i
 	}
 }
 
-/* ytxing:	
- * get the loss rate of the sk, make sure this interval is COMPLETED		
- * in (0, 1) << OLSCHED_SCALE
- */
-// static u64 ol_get_loss_rate(struct ol_interval *interval)
-// {
-// 	u64 loss_rate;
-// 	u32 delivered;
-
-// 	/* nothing delivered */
-// 	if (interval->delivered_end == interval->delivered_begin)
-// 		return (1 << OLSCHED_SCALE); 
-
-// 	loss_rate = (interval->lost_end - interval->lost_begin) << OLSCHED_SCALE;
-// 	delivered = interval->delivered_end - interval->delivered_begin;
-
-// 	do_div(loss_rate, delivered);
-// 	return loss_rate;
-// }
-
 /* tweak the suggested ratio and setup four intervals */
 static void ol_setup_intervals_MAB(struct sock *sk, int arm_idx)
 {	
@@ -1100,9 +1080,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 			interval_duration = meta_interval->interval_duration;
 
 			meta_interval->snd_ended = true;
-			printk(KERN_INFO "ytxing: tp:%p (meta:%d) SND END bytes:%u snd_dur:%llu interval_dur:%u\n",\
-				meta_tp, is_meta_tp(meta_tp), meta_interval->snd_seq_end - meta_interval->snd_seq_begin, meta_interval->snd_time_end - meta_interval->snd_time_begin, interval_duration);
-
+			printk(KERN_INFO "ytxing: tp:%p (meta:%d) SND END packets_sent:%u\n", meta_tp, is_meta_tp(meta_tp), packets_sent);
 		}
 	}
 	
