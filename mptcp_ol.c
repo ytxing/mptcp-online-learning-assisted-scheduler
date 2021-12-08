@@ -60,8 +60,8 @@ MODULE_PARM_DESC(DEBUG_USE_GAMMA_TUNING, "use reward monitor?");	/*模块参数�
  */
 #define OLSCHED_INTERVALS_DURATION_N_RTT 5/2 /* n * RTT */
 #define OLSCHED_INTERVALS_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 3
-#define OLSCHED_DCP_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 30 /* a timeout for decoupled bandwidth */
-#define OLSCHED_MAX_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 30 /* a timeout for decoupled bandwidth */
+#define OLSCHED_DCP_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 100 /* a timeout for decoupled bandwidth */
+#define OLSCHED_MAX_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 100 /* a timeout for decoupled bandwidth */
 #define OLSCHED_INTERVAL_MIN_PACKETS 30
 
 #define OLSCHED_SAFE_MAX_WEIGHT 0x0000000fffffffff /* u32 */
@@ -346,12 +346,19 @@ static void ol_update_max_bandwidth_interval(struct ol_gambler *gambler, struct 
 {
 	struct ol_priv *ol_p = ol_get_priv(tp);
 	u64 curr_bandwidth = ol_get_bandwidth_interval(interval, tp);
+	bool nearly_timeout = tp->tcp_mstamp > ol_p->global_data->bwd_update_time + OLSCHED_MAX_BWD_TIMEOUT / 2;
 	bool timeout = tp->tcp_mstamp > ol_p->global_data->bwd_update_time + OLSCHED_MAX_BWD_TIMEOUT;
 
 	/* detect higher bandwidth or expire, update */
-	if (curr_bandwidth > ol_p->global_data->decoupled_bandwdith || timeout){
+	if (curr_bandwidth > ol_p->global_data->decoupled_bandwdith){
 		ol_p->global_data->decoupled_bandwdith = curr_bandwidth;
 		ol_p->global_data->bwd_update_time = tp->tcp_mstamp;
+		return;
+	}
+	if (nearly_timeout && gambler->current_arm_idx == 0){
+		ol_p->global_data->decoupled_bandwdith = curr_bandwidth;
+		ol_p->global_data->bwd_update_time = tp->tcp_mstamp;
+		return;
 	}
 	gambler->force_decoupled = timeout;
 
