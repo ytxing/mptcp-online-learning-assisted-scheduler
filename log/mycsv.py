@@ -2,7 +2,7 @@
 import time
 import os
 import sys
-import csv
+import decodejson
 
 def get_scheduler_csv(dir):
 
@@ -79,6 +79,31 @@ def get_all_csv(dir: str):
         with open( os.path.join(dir,'{}-final.csv'.format(name.replace('/', '-'))), 'w' ) as f:
             f.write('\n'.join(final_csv_file))
 
+def get_trunk_csv(dir: str):
+    header = []
+    final_csv_file = []
+
+    for (root, subdirs, files) in os.walk(dir):
+        subdirs.sort()
+        files.sort()
+        for file in files:
+            if file.find("final_trunk.csv") != -1:
+                print('DELETE OLD CSV FILE')
+                return
+
+            if file.find("sum_bytes") != -1:
+                # print(file)
+                with open( os.path.join(root,file), 'r' ) as f:
+                    lines = f.readlines()
+                for i in range(len(lines)):
+                    lines[i] = lines[i].strip()
+                
+                final_csv_file.append('{},{},{}'.format(root.split('/')[-1], lines[0].split(',')[3], lines[1].split(',')[2]))
+
+    if (len(final_csv_file) > 0):
+        name = dir.strip('/').split('/')[-1]
+        with open( os.path.join(dir,'{}-trunk-final.csv'.format(name.replace('/', '-'))), 'w' ) as f:
+            f.write('\n'.join(final_csv_file))
 # def calssify(csv_file, key):
 #     with open(csv_file) as f:
 #             reader = csv.DictReader(f)
@@ -89,5 +114,6 @@ def get_all_csv(dir: str):
             
 
 if __name__ == '__main__':
+    decodejson.get_dir_json(sys.argv[1])
     get_scheduler_csv(sys.argv[1])
-    get_all_csv(sys.argv[1])
+    get_trunk_csv(sys.argv[1])

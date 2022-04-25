@@ -71,16 +71,13 @@ def collect_data(local_dir, sub_dir):
 def timer(timeout, iperf_t: multiprocessing.Process):
     global now_second, total_second, crash_cnt
     now_tmp = now_second
-    more_time = 30
+    more_time = 20
     for i in range(int(timeout) + more_time):
-        myprint('Timing: {}/{}+{} [{}s/{}s({:.2f}h left)] [crashes:{}]'.format(i, timeout, more_time, now_second, total_second, float((total_second - now_second) / 3600), crash_cnt), end='\r')
+        myprint('Timing: {}/{}+{}] [crashes:{}]'.format(i, timeout, more_time, crash_cnt), end='\r')
         time.sleep(1)
         now_second += 1
         if iperf_t.is_alive() == False:
             myprint('\niperf finished!')
-            if now_second - now_tmp < int(timeout) - 8:
-                myprint('iperf finished eariler than expected!')
-                return True
             return False
     if iperf_t.is_alive():
         iperf_t.terminate()
@@ -151,20 +148,21 @@ def stop_iperfs():
 
     return flag
 
-def go_iperf(scheduler, round, duration, window, ns3_left_argv, ns3_right_argv, use_monitor, fix_arm, fix_arm_idx, gamma_hi, gamma_lo, hi_gamma_dur, host_dir, local_dir):
+def go_iperf(cc, scheduler, round, duration, trunk_size, window, ns3_left_argv, ns3_right_argv, host_dir, local_dir):
     global total, total_round, crash_cnt
+
     cmd_to_host(server_name, "cat /sys/module/mptcp_ol/parameters/DEBUG_USE_NEW_EPOCH")
     cmd_to_host(server_name, "cat /sys/module/mptcp_ol/parameters/DEBUG_USE_GAMMA_TUNING")
     cmd_to_host_sudo(server_name, 'sysctl net.mptcp.mptcp_scheduler={}'.format(scheduler))
     cmd_local('echo a | sudo -S echo > {}ns3_info_left.log 2>&1 &'.format(local_log_path))
     cmd_local('echo a | sudo -S echo > {}ns3_info_right.log 2>&1 &'.format(local_log_path))
-    sub_dir = window + '-' + str(duration) + 's-L' + ns3_left_argv.replace(' ', '')+ '-R' + ns3_right_argv.replace(' ', '')
-    sub_dir = sub_dir + '-' + scheduler 
-    if use_monitor == False:
-        sub_dir += '-monoff'
-    if fix_arm == True:
-        sub_dir += '-fix{}'.format(fix_arm_idx)
-    sub_dir += "-hi{}lo{}dur{}".format(gamma_hi, gamma_lo,hi_gamma_dur)
+    if trunk_size == '':
+        sub_dir = window + '-' + str(duration) + 's-L' + ns3_left_argv.replace(' ', '')+ '-R' + ns3_right_argv.replace(' ', '')
+        use_trunk = False
+    else:
+        sub_dir = window + '-' + str(trunk_size) + '-L' + ns3_left_argv.replace(' ', '')+ '-R' + ns3_right_argv.replace(' ', '')
+        use_trunk = True
+    sub_dir = sub_dir + '-' + scheduler + '-' + cc 
     
     sub_dir = '{}/{}'.format(host_dir, sub_dir)
     
@@ -176,26 +174,15 @@ def go_iperf(scheduler, round, duration, window, ns3_left_argv, ns3_right_argv, 
         cmd_to_host_sudo(server_name, '/home/a/setup-network.sh')
         cmd_to_host_sudo(client_name, '/home/a/setup-network.sh')
         time.sleep(0.3)
-        if use_monitor:  
-            cmd_to_host_root(server_name_root, "echo Y > /sys/module/mptcp_ol/parameters/DEBUG_USE_NEW_EPOCH")
-            cmd_to_host_root(server_name_root, "echo Y > /sys/module/mptcp_ol/parameters/DEBUG_USE_GAMMA_TUNING")
-        else:
-            cmd_to_host_root(server_name_root, "echo N > /sys/module/mptcp_ol/parameters/DEBUG_USE_NEW_EPOCH")
-            cmd_to_host_root(server_name_root, "echo N > /sys/module/mptcp_ol/parameters/DEBUG_USE_GAMMA_TUNING")
-        cmd_to_host(server_name, "cat /sys/module/mptcp_ol/parameters/DEBUG_USE_NEW_EPOCH")
-        cmd_to_host(server_name, "cat /sys/module/mptcp_ol/parameters/DEBUG_USE_GAMMA_TUNING")
-
-        if fix_arm:  
-            cmd_to_host_root(server_name_root, "echo Y > /sys/module/mptcp_ol/parameters/DEBUG_FIX_ARM")
-            cmd_to_host_root(server_name_root, "echo {} > /sys/module/mptcp_ol/parameters/DEBUG_FIXED_ARM_IDX".format(fix_arm_idx))
-        else:
-            cmd_to_host_root(server_name_root, "echo N > /sys/module/mptcp_ol/parameters/DEBUG_FIX_ARM")
-
-        cmd_to_host_root(server_name_root, "echo {} > /sys/module/mptcp_ol/parameters/OLSCHED_LO_GAMMA_MAB".format(gamma_lo))
-        cmd_to_host_root(server_name_root, "echo {} > /sys/module/mptcp_ol/parameters/OLSCHED_HI_GAMMA_MAB".format(gamma_hi))
-        cmd_to_host_root(server_name_root, "echo {} > /sys/module/mptcp_ol/parameters/OLSCHED_EPOCH_DURATION_PER_ARM".format(hi_gamma_dur))
 
         cmd_to_host_sudo(server_name, 'sysctl net.mptcp.mptcp_scheduler={}'.format(scheduler))
+        if cc == 'bbr':
+            cmd_to_host_sudo(server_name, 'sysctl net.ipv4.tcp_congestion_control={}'.format(cc))
+            cmd_to_host_sudo(server_name, 'sysctl net.core.default_qdisc=fq')
+        else:
+            cmd_to_host_sudo(server_name, 'sysctl net.ipv4.tcp_congestion_control={}'.format(cc))
+            cmd_to_host_sudo(server_name, 'sysctl net.core.default_qdisc=pfifo_fast')
+
         left_pid = ps_check(ns3_left_name)
         right_pid = ps_check(ns3_right_name)
         if left_pid != -1:
@@ -237,15 +224,16 @@ def go_iperf(scheduler, round, duration, window, ns3_left_argv, ns3_right_argv, 
         myprint('PID {}: {}'.format(ns3_right_name, right_pid))
         cmd_to_host(client_name, 'touch {}/{}iperf.json'.format(sub_dir, i))
         cmd_to_host(client_name, 'echo > {}/{}iperf.json'.format(sub_dir, i))
-        iperf_t = multiprocessing.Process(target=cmd_to_host, args=(client_name, 'iperf3 -c 10.0.0.1 -i 1 -t {} -w {} -J -R --logfile {}/{}iperf.json'.format(duration, window, sub_dir, i),))
-        # cmd_to_host(client_name, 'iperf3 -c 10.0.0.1 -i 1 -t {} -w {} -J -R --logfile {}/{}iperf.json'.format(duration, window, sub_dir, i))
+        if use_trunk:
+            iperf_t = multiprocessing.Process(target=cmd_to_host, args=(client_name, 'iperf3 -c 10.0.0.1 -i 1 -n {} -w {} -J -R --logfile {}/{}iperf.json'.format(trunk_size, window, sub_dir, i),))
+        else:
+            iperf_t = multiprocessing.Process(target=cmd_to_host, args=(client_name, 'iperf3 -c 10.0.0.1 -i 1 -t {} -w {} -J -R --logfile {}/{}iperf.json'.format(duration, window, sub_dir, i),))
         iperf_t.start()
         wrong = timer(duration, iperf_t)
         iperf_t.join()
         if wrong:
             restart_server()
             crash_cnt += 1
-            continue
         cmd_to_host(server_name, 'cat /var/log/kern.log | grep ytxing >> {}/{}kernlog.log'.format(sub_dir, i))
         cmd_local('echo a | sudo kill {}'.format(left_pid))
         cmd_local('echo a | sudo kill {}'.format(right_pid))
@@ -262,8 +250,9 @@ def run_exp(experiments, note):
     # ns3_right_argv = '-changetime=200 -change_owd=1'
     # experiments = [['ol', 1]]
     for x in experiments:
-        total = (total + x[1]) 
-        total_second = total_second + int(x[2]) * x[1]
+        total = (total + x[2]) 
+        total_second = total_second + int(x[3]) * x[2]
+
 
     
     # cmd_to_host_sudo(server_name, '/home/a/setup-network.sh')
@@ -276,7 +265,8 @@ def run_exp(experiments, note):
     os.system('chmod 777 {}/command.txt'.format(local_dir))
     cmd_to_host(client_name, 'mkdir -p {}'.format(host_dir))
     for experiment in experiments:
-        go_iperf(experiment[0], experiment[1], experiment[2], experiment[3], experiment[4], experiment[5], experiment[6], experiment[7], experiment[8], experiment[9], experiment[10], experiment[11], host_dir, local_dir)
+        # cc, scheduler, round, duration, trunk_size, window, ns3_left_argv, ns3_right_argv, host_dir, local_dir
+        go_iperf(experiment[0], experiment[1], experiment[2], experiment[3], experiment[4], experiment[5], experiment[6], experiment[7], host_dir, local_dir)
         os.system('echo \"{}\" >> {}/done_exps.txt'.format(experiment, local_dir))
 
     cmd_local('find . -name "*" -type f -size 0c | xargs -n 1 rm -f')
@@ -289,17 +279,11 @@ def run_exp(experiments, note):
 
 def main():
     global ns3_left_name, ns3_right_name
-    # scheduler, round, duration, window, ns3_left_argv, ns3_right_argv, use_monitor, fix_arm, fix_arm_idx, gamma_hi, gamma_lo, hi_gamma_dur, host_dir, local_dir
-    ns3_left_name = 'nmb1'
-    ns3_right_name = 'nmb2'
-    note = "gogogo"
-    experiments = [
-        ["ol",          16,200,"50k","","-owd=30ms -loss=0 -pos=110 -rightx=150 -speedx=0.5 -stayfor=60",False,False,0,40,10,15],
-        ["default",     8 ,200,"50k","","-owd=30ms -loss=0 -pos=110 -rightx=150 -speedx=0.5 -stayfor=60",True,False,0,40,10,15],
-        ["ol",          16,200,"50k","","-owd=30ms -loss=0 -pos=110 -rightx=150 -speedx=0.5 -stayfor=60",True,False,0,40,10,15],
-        ["roundrobin",  8 ,200,"50k","","-owd=30ms -loss=0 -pos=110 -rightx=150 -speedx=0.5 -stayfor=60",True,False,0,40,10,15],
-    ]
 
+    ns3_left_name = 'p2pnmb1'
+    ns3_right_name = 'p2pnmb2'
+    note = "WSP-gimme_20211230_103655_1125"
+    experiments = expscript.gimme_20211230_103655_1125()
     run_exp(experiments, note)
 
 if __name__ == '__main__':
