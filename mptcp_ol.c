@@ -242,6 +242,11 @@ struct ol_priv {
 	struct ol_global *global_data;
 };
 
+/* The MPTCP_SCHED_SIZE limitation */
+struct ol_priv_out {
+	struct ol_priv *ol_p;
+};
+
 /* Struct to store the data of the control block */
 struct ol_cb {
 	/* The next subflow where a skb should be sent or NULL */
@@ -251,16 +256,34 @@ struct ol_cb {
 	struct ol_monitor *monitor;
 };
 
+struct ol_cb_out {
+	struct ol_cb* ol_cb;
+};
+
+/* Returns the socket data from a given subflow socket */
+static struct ol_priv_out *ol_get_priv_out(struct tcp_sock *tp)
+{
+	return (struct ol_priv_out *)&tp->mptcp->mptcp_sched[0];
+}
+
 /* Returns the socket data from a given subflow socket */
 static struct ol_priv *ol_get_priv(struct tcp_sock *tp)
 {
-	return (struct ol_priv *)&tp->mptcp->mptcp_sched[0];
+	struct ol_priv_out *ol_p_out = ol_get_priv_out(tp);
+	return (struct ol_priv *)ol_p_out->ol_p;
+}
+
+/* Returns the control block data from a given meta socket */
+static struct ol_cb_out *ol_get_cb_out(struct tcp_sock *tp)
+{
+	return (struct ol_cb_out *)&tp->mpcb->mptcp_sched[0];
 }
 
 /* Returns the control block data from a given meta socket */
 static struct ol_cb *ol_get_cb(struct tcp_sock *tp)
 {
-	return (struct ol_cb *)&tp->mpcb->mptcp_sched[0];
+	struct ol_cb_out *ol_cb_out = ol_get_cb_out(tp);
+	return (struct ol_cb *)ol_cb_out->ol_cb;
 }
 
 /* get x = number * OLSCHED_UNIT, return (e^number)*OLSCHED_UNIT */
@@ -1614,9 +1637,15 @@ static void ol_release(struct sock *sk)
 
 static void ol_init(struct sock *sk)
 {
-	struct ol_priv *ol_p = ol_get_priv(tcp_sk(sk));
+	struct ol_priv *ol_p;
+	struct ol_cb *ol_cb;
 	int i;
-	struct ol_cb *ol_cb = ol_get_cb(tcp_sk(mptcp_meta_sk(sk)));
+	struct ol_priv_out *ols_p_out = ol_get_priv_out(tcp_sk(sk));
+	struct ol_cb_out *ols_cb_out = ol_get_cb_out(tcp_sk(mptcp_meta_sk(sk)));
+	ols_p_out->ol_p = kzalloc(sizeof(struct ol_priv), GFP_KERNEL);
+	ol_p = ol_get_priv(tcp_sk(sk));
+	ols_cb_out->ol_cb = kzalloc(sizeof(struct ol_cb), GFP_KERNEL);
+	ol_cb = ol_get_cb(tcp_sk(mptcp_meta_sk(sk)));
 
 
 	ol_p->intervals_data = kzalloc(sizeof(struct ol_interval) * OLSCHED_INTERVALS_NUM, GFP_KERNEL);
@@ -1706,8 +1735,8 @@ static int __init ol_register(void)
 {
 	printk(KERN_DEBUG "ytxing: ol_priv size :%lu (< %u)\n", sizeof(struct ol_priv), MPTCP_SCHED_SIZE);
 	printk(KERN_DEBUG "ytxing: ol_cb size :%lu (< %u)\n", sizeof(struct ol_cb), MPTCP_SCHED_DATA_SIZE);
-	BUILD_BUG_ON(sizeof(struct ol_priv) > MPTCP_SCHED_SIZE);
-	BUILD_BUG_ON(sizeof(struct ol_cb) > MPTCP_SCHED_DATA_SIZE);
+	BUILD_BUG_ON(sizeof(struct ol_priv_out) > MPTCP_SCHED_SIZE);
+	BUILD_BUG_ON(sizeof(struct ol_cb_out) > MPTCP_SCHED_DATA_SIZE);
 	if (mptcp_register_scheduler(&mptcp_sched_ol))
 		return -1;
 	return 0;
