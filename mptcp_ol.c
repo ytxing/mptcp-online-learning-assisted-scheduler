@@ -77,13 +77,17 @@ MODULE_PARM_DESC(DEBUG_USE_GAMMA_TUNING, "use reward monitor?");	/*模块参数�
 
 /* ytxing: for utility function calculation */
 static int OLSCHED_LO_GAMMA_MAB __read_mostly = 20; 
-module_param(OLSCHED_LO_GAMMA_MAB, int, 0644);	/*模块参数类型，权限*/
-MODULE_PARM_DESC(OLSCHED_LO_GAMMA_MAB, "OLSCHED_LO_GAMMA_MAB");	/*模块参数说明*/
+module_param(OLSCHED_LO_GAMMA_MAB, int, 0644);	
+MODULE_PARM_DESC(OLSCHED_LO_GAMMA_MAB, "OLSCHED_LO_GAMMA_MAB");	
+
 // #define OLSCHED_LO_GAMMA_MAB 30 /* div by OLSCHED_GAMMA_MAB_BASE */ 
 static int OLSCHED_HI_GAMMA_MAB __read_mostly = 50; 
-module_param(OLSCHED_HI_GAMMA_MAB, int, 0644);	/*模块参数类型，权限*/
-MODULE_PARM_DESC(OLSCHED_HI_GAMMA_MAB, "OLSCHED_HI_GAMMA_MAB");	/*模块参数说明*/
-// #define OLSCHED_HI_GAMMA_MAB 60 /* div by OLSCHED_GAMMA_MAB_BASE */ 
+module_param(OLSCHED_HI_GAMMA_MAB, int, 0644);
+MODULE_PARM_DESC(OLSCHED_HI_GAMMA_MAB, "OLSCHED_HI_GAMMA_MAB");	
+
+static int OLSCHED_ACTIVATION_B __read_mostly = 4; 
+module_param(OLSCHED_ACTIVATION_B, int, 0644);
+MODULE_PARM_DESC(OLSCHED_ACTIVATION_B, "OLSCHED_ACTIVATION_B");	
 #define OLSCHED_GAMMA_MAB_BASE 100
 
 
@@ -254,6 +258,7 @@ struct ol_cb {
 	struct ol_interval *meta_interval;
 	struct ol_gambler *gambler;
 	struct ol_monitor *monitor;
+	u32 count;
 };
 
 struct ol_cb_out {
@@ -287,7 +292,7 @@ static struct ol_cb *ol_get_cb(struct tcp_sock *tp)
 }
 
 /* get x = number * OLSCHED_UNIT, return (e^number)*OLSCHED_UNIT */
-static u32 ol_exp(u32 x)
+static u64 ol_exp(u32 x)
 {
 	s64 temp = OLSCHED_UNIT;
 	s64 e = OLSCHED_UNIT;
@@ -302,7 +307,18 @@ static u32 ol_exp(u32 x)
 	return e;
 }
 
-
+/* get x = number * OLSCHED_UNIT, return (e^b(number-1)*OLSCHED_UNIT */
+static u64 ol_activate_reward(u64 x)
+{
+	u64 e_bx;
+	u64 e_b;
+	u64 b = OLSCHED_ACTIVATION_B;
+	e_bx = ol_exp(b * x);
+	e_b = ol_exp(b * OLSCHED_UNIT);
+	e_bx *= OLSCHED_UNIT;
+	do_div(e_bx, e_b);
+	return min_t(u64, e_bx, x);
+}
 static int ol_get_active_valid_sks_num(struct sock *meta_sk)
 {
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
@@ -441,8 +457,9 @@ bool ol_current_send_interval_end_ready(struct ol_interval *interval, struct tcp
 		return false;
 
 	/* not enough sending duration */
-	if (interval->snd_time_end - interval->snd_time_begin < interval_duration)
+	if (interval->snd_time_end - interval->snd_time_begin < interval_duration){
 		return false;
+	}
 
 	if (interval->snd_end_ready == true)
 		return true;
@@ -585,6 +602,10 @@ void ol_update_arm_probality(struct sock *meta_sk)
 	u64 temp;
 	int i;
 
+	ol_cb->count++;
+	
+	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) ol_update_arm_probality count:%u\n", meta_tp, ol_cb->count);
+
 	if (ol_cb->monitor->hi_gamma_flag && DEBUG_USE_GAMMA_TUNING){
 		gamma = OLSCHED_HI_GAMMA_MAB;
 		ol_cb->monitor->hi_gamma_duration --;
@@ -613,8 +634,9 @@ void ol_update_arm_probality(struct sock *meta_sk)
 		temp /= OLSCHED_GAMMA_MAB_BASE;
 		gambler->arm_probability[i] = temp + gamma_over_K;
 		// printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_probability[%d]:%u/1024 count:%u\n", meta_tp, i, gambler->arm_probability[i] >> 3, gambler->arm_count[i]);
-		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) temp:%llu gamma_over_K:%llu hi_gamma left:%u epoch_duration:%u\n", meta_tp, temp >> 3, gamma_over_K >> 3, ol_cb->monitor->hi_gamma_duration, ol_cb->monitor->epoch_duration);
+		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) arm_idx:%d temp:%llu gamma_over_K:%llu hi_gamma left:%u epoch_duration:%u\n", meta_tp, i,temp >> 3, gamma_over_K >> 3, ol_cb->monitor->hi_gamma_duration, ol_cb->monitor->epoch_duration);
 	}
+	
 
 }
 
@@ -744,7 +766,7 @@ static void update_interval_info_rcv(struct ol_interval *interval, struct tcp_so
 		interval->rcv_time_end = tp->tcp_mstamp;
 		if (interval->snd_ended){
 			interval->rcv_ended = true;
-			// printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) RCV END bytes:%u srtt(us):%u all_dur:%llu bwd:%llu\n", tp, is_meta_tp(tp), interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
+			printk(KERN_DEBUG "ytxing: tp:%p (meta:%d) RCV END bytes:%u srtt(us):%u all_dur:%llu bwd:%llu\n", tp, is_meta_tp(tp), interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
 		}
 
 		return;
@@ -872,7 +894,7 @@ void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 	}
 	if (monitor->arm_reward_mdev[arm_idx] == 0){
 		tmp_mdev = curr_reward - monitor->smoothed_arm_reward[arm_idx];
-		monitor->arm_reward_mdev[arm_idx] = tmp_mdev;
+		monitor->arm_reward_mdev[arm_idx] = abs(tmp_mdev);
 		monitor->smoothed_arm_reward[arm_idx] = monitor->smoothed_arm_reward[arm_idx] - (monitor->smoothed_arm_reward[arm_idx] >> 3) + (curr_reward >> 3);
 		printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) MON curr_reward:%llu smoothed_arm_reward[%d]:%llu %d * arm_reward_mdev:%llu changing_count:%d\n",\
 		meta_tp, curr_reward >> 3, arm_idx, monitor->smoothed_arm_reward[arm_idx] >> 3, OLSCHED_MDEV_MUL, monitor->arm_reward_mdev[arm_idx] >> 3, monitor->changing_count[arm_idx]);
@@ -936,7 +958,6 @@ void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 	tmp_mdev = curr_reward - monitor->smoothed_arm_reward[arm_idx];
 	monitor->arm_reward_mdev[arm_idx] = monitor->arm_reward_mdev[arm_idx] - (monitor->arm_reward_mdev[arm_idx] >> 3) + (abs(tmp_mdev) >> 3);
 	monitor->smoothed_arm_reward[arm_idx] = monitor->smoothed_arm_reward[arm_idx] - (monitor->smoothed_arm_reward[arm_idx] >> 3) + (curr_reward >> 3);
-
 	return;
 }
 
@@ -987,7 +1008,7 @@ static void ol_exp3_update(struct sock *meta_sk)
 	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 	struct ol_gambler *gambler = ol_cb->gambler;
 	struct ol_monitor *monitor = ol_cb->monitor;
-	u64 reward, exp_reward;
+	u64 reward, active_reward, exp_reward;
 	u64 temp;
 	int i;
 
@@ -996,6 +1017,9 @@ static void ol_exp3_update(struct sock *meta_sk)
 
 	/* receive reward from the network */
 	reward = ol_calc_reward(meta_sk); // reward << OLSCHED_SCALE, actually. Since 0 < reward <= 1. 
+	active_reward = ol_activate_reward(reward);
+	printk(KERN_DEBUG "ytxing: tp:%p (meta_tp) reward:%llu active_reward:%llu\n", meta_tp, reward, active_reward);
+	reward = active_reward;
 	
 	ol_check_reward_difference(reward, meta_sk);
 	// reward = monitor->smoothed_arm_reward[gambler->previous_arm_idx];
@@ -1530,7 +1554,8 @@ static struct sk_buff *mptcp_ol_next_segment_rtt(struct sock *meta_sk,
 	
 	/* process ol model immediately, since sending nothing doesn't mean receiving nothing */
 	if (active_valid_sks >= 2){
-	ol_process_all_subflows(meta_sk, &new_interval_started);
+		// printk(KERN_DEBUG "ytxing: ol_process_all_subflows\n");
+		ol_process_all_subflows(meta_sk, &new_interval_started);
 	}
 	
 
@@ -1669,7 +1694,7 @@ static void ol_init(struct sock *sk)
 	ol_p->global_data->decoupled_bandwdith = 0;
 	ol_p->global_data->bwd_update_time = 0;
 
-
+	ol_cb->count = 0;
 	if (!ol_cb->meta_interval){
 		ol_cb->meta_interval = kzalloc(sizeof(struct ol_interval) * OLSCHED_INTERVALS_NUM, GFP_KERNEL);
 		ol_cb->meta_interval->index = 0;
@@ -1733,8 +1758,6 @@ static struct mptcp_sched_ops mptcp_sched_ol = {
 
 static int __init ol_register(void)
 {
-	printk(KERN_DEBUG "ytxing: ol_priv size :%lu (< %u)\n", sizeof(struct ol_priv), MPTCP_SCHED_SIZE);
-	printk(KERN_DEBUG "ytxing: ol_cb size :%lu (< %u)\n", sizeof(struct ol_cb), MPTCP_SCHED_DATA_SIZE);
 	BUILD_BUG_ON(sizeof(struct ol_priv_out) > MPTCP_SCHED_SIZE);
 	BUILD_BUG_ON(sizeof(struct ol_cb_out) > MPTCP_SCHED_DATA_SIZE);
 	if (mptcp_register_scheduler(&mptcp_sched_ol))
