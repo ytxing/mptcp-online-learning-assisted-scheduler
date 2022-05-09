@@ -1007,7 +1007,6 @@ static void ol_exp3_update(struct sock *meta_sk)
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
 	struct ol_gambler *gambler = ol_cb->gambler;
-	struct ol_monitor *monitor = ol_cb->monitor;
 	u64 reward, active_reward, exp_reward;
 	u64 temp;
 	int i;
@@ -1412,123 +1411,6 @@ static struct sk_buff *ol_next_skb_from_queue(struct sk_buff_head *queue,
 		return skb;
 
 	return tcp_send_head(meta_sk);
-}
-
-static struct sk_buff *mptcp_ol_next_segment(struct sock *meta_sk,
-					      int *reinject,
-					      struct sock **subsk,
-					      unsigned int *limit)
-{
-	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
-	struct mptcp_cb *mpcb = meta_tp->mpcb;
-	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
-	struct tcp_sock *first_tp = ol_cb->next_subflow, *tp;
-	struct mptcp_tcp_sock *mptcp;
-	int active_valid_sks = -1;
-	struct sk_buff *skb;
-	int found = 0;
-
-	/* As we set it, we have to reset it as well. */
-	*limit = 0;
-
-	if (skb_queue_empty(&mpcb->reinject_queue) &&
-	    skb_queue_empty(&meta_sk->sk_write_queue) &&
-	    tcp_rtx_queue_empty(meta_sk))
-		/* Nothing to send */
-		return NULL;
-
-	/* First try reinjections */
-	skb = skb_peek(&mpcb->reinject_queue);
-	if (skb) {
-		*subsk = get_available_subflow(meta_sk, skb, false);
-		if (!*subsk)
-			return NULL;
-		*reinject = 1;
-		return skb;
-	}
-
-	/* Then try indistinctly redundant and normal skbs */
-
-	if (!first_tp && !hlist_empty(&mpcb->conn_list)) {
-		first_tp = hlist_entry_safe(rcu_dereference_raw(hlist_first_rcu(&mpcb->conn_list)),
-					    struct mptcp_tcp_sock, node)->tp;
-	}
-
-	/* still NULL (no subflow in conn_list?) */
-	if (!first_tp)
-		return NULL;
-
-	tp = first_tp;
-
-	*reinject = 0;
-	active_valid_sks = ol_get_active_valid_sks_num(meta_sk);
-
-	/* We want to pick a subflow that is after 'first_tp' in the list of subflows.
-	 * Thus, the first mptcp_for_each_sub()-loop tries to walk the list up
-	 * to the subflow 'tp' and then checks whether any one of the remaining
-	 * ones can send a segment.
-	 * The second mptcp_for_each-sub()-loop is then iterating from the
-	 * beginning of the list up to 'first_tp'.
-	 */
-	mptcp_for_each_sub(mpcb, mptcp) {
-		struct ol_priv *ol_p;
-
-		if (tp == mptcp->tp)
-			found = 1;
-
-		if (!found)
-			continue;
-
-		tp = mptcp->tp;
-
-		/* Correct the skb pointers of the current subflow */
-		ol_p = ol_get_priv(tp);
-		ol_correct_skb_pointers(meta_sk, ol_p);
-
-		skb = ol_next_skb_from_queue(&meta_sk->sk_write_queue,
-						   ol_p->skb, meta_sk);
-		if (skb && ol_use_subflow(meta_sk, active_valid_sks, tp,
-						skb)) {
-			ol_p->skb = skb;
-			ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
-			ol_update_next_subflow(tp, ol_cb);
-			*subsk = (struct sock *)tp;
-
-			if (TCP_SKB_CB(skb)->path_mask)
-				*reinject = -1;
-			return skb;
-		}
-	}
-
-	mptcp_for_each_sub(mpcb, mptcp) {
-		struct ol_priv *ol_p;
-
-		tp = mptcp->tp;
-
-		if (tp == first_tp)
-			break;
-
-		/* Correct the skb pointers of the current subflow */
-		ol_p = ol_get_priv(tp);
-		ol_correct_skb_pointers(meta_sk, ol_p);
-
-		skb = ol_next_skb_from_queue(&meta_sk->sk_write_queue,
-						   ol_p->skb, meta_sk);
-		if (skb && ol_use_subflow(meta_sk, active_valid_sks, tp,
-						skb)) {
-			ol_p->skb = skb;
-			ol_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
-			ol_update_next_subflow(tp, ol_cb);
-			*subsk = (struct sock *)tp;
-
-			if (TCP_SKB_CB(skb)->path_mask)
-				*reinject = -1;
-			return skb;
-		}
-	}
-
-	/* Nothing to send */
-	return NULL;
 }
 
 // ytxing: 	1. find a subflow with minimal RTT;
