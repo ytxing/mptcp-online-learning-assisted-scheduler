@@ -506,7 +506,7 @@ bool ol_all_subflow_send_interval_ended(struct tcp_sock *meta_tp)
 			// u32 interval_duration = interval->interval_duration;
 
 			interval->snd_ended = true;
-			mptcp_debug("ytxing: tp:%p (meta:%d) SND END bytes:%u snd_dur:%llu interval_dur:%u\n",\
+			// mptcp_debug("ytxing: tp:%p (meta:%d) SND END bytes:%u snd_dur:%llu interval_dur:%u\n",\
 			tp, is_meta_tp(tp), interval->snd_seq_end - interval->snd_seq_begin, interval->snd_time_end - interval->snd_time_begin, interval->interval_duration);
 
 		}
@@ -743,6 +743,7 @@ static u64 ol_get_UCB(struct sock *meta_sk, int arm_idx) {
 	fixedpt_sqrt_item = fixedpt_sqrt(fixedpt_sqrt_item);
 	sqrt_item = fixedpt_sqrt_item >> (FIXEDPT_FBITS - OLSCHED_SCALE); /* in OLSCHED_UNIT, i.e., << OLSCHED_SCALE */
 	UCB_result = reward_bar + sqrt_item;
+	// mptcp_debug("ytxing: tp:%p (meta_tp) arm_idx:%d UCB_result:%llu reward_bar:%llu sqrt_item:%llu\n", meta_tp, arm_idx, UCB_result >> 3, reward_bar >> 3, sqrt_item >> 3);
 	
 	return UCB_result;
 }
@@ -764,20 +765,19 @@ u8 pull_the_arm_UCB(struct sock *meta_sk)
 		}
 		curr_UCB = ol_get_UCB(meta_sk, arm_idx);
 		
-		mptcp_debug("ytxing: tp:%p (meta_tp) arm_idx:%d curr_UCB:%llu avg_reward:%llu count:%u\n", meta_tp, arm_idx, curr_UCB, gambler->arm_avg_reward[arm_idx], gambler->arm_count[arm_idx]);
+		mptcp_debug("ytxing: tp:%p (meta_tp) arm_idx:%d curr_UCB:%llu avg_reward:%llu count:%u\n", meta_tp, arm_idx, curr_UCB >> 3, gambler->arm_avg_reward[arm_idx] >> 3, gambler->arm_count[arm_idx]);
 		if (curr_UCB > hi_UCB){
 			hi_UCB = curr_UCB;
 			hi_arm_idx = arm_idx;
 		}
 	}
-	mptcp_debug("ytxing: tp:%p (meta_tp) arm_count_total:%u\n", meta_tp, gambler->arm_count_total);
-	
+
 	gambler->arm_count[hi_arm_idx] ++;
 	gambler->arm_count_total ++;
 	gambler->current_arm_idx = hi_arm_idx;
+	mptcp_debug("ytxing: tp:%p (meta_tp) arm_count_total:%u hi_arm_idx:%u arm_count:%u\n", meta_tp, gambler->arm_count_total, hi_arm_idx, gambler->arm_count[hi_arm_idx]);
 	return hi_arm_idx;
 }
-
 
 static void update_interval_info_snd(struct ol_interval *interval, struct tcp_sock *tp)
 {
@@ -822,7 +822,7 @@ static void update_interval_info_rcv(struct ol_interval *interval, struct tcp_so
 		interval->rcv_time_end = tp->tcp_mstamp;
 		if (interval->snd_ended){
 			interval->rcv_ended = true;
-			mptcp_debug("ytxing: tp:%p (meta:%d) RCV END bytes:%u srtt(us):%u all_dur:%llu bwd:%llu\n", tp, is_meta_tp(tp), interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
+			// mptcp_debug("ytxing: tp:%p (meta:%d) RCV END bytes:%u srtt(us):%u all_dur:%llu bwd:%llu\n", tp, is_meta_tp(tp), interval->snd_seq_end - interval->snd_seq_begin, tp->srtt_us >> 3, interval->rcv_time_end - interval->snd_time_begin, ol_get_bandwidth_interval(interval, tp));
 		}
 
 		return;
@@ -1072,7 +1072,7 @@ static void ol_update_exp3(struct sock *meta_sk)
 	/* receive reward from the network */
 	reward = ol_calc_reward(meta_sk); // reward << OLSCHED_SCALE, actually. Since 0 < reward <= 1. 
 	active_reward = ol_activate_reward(reward);
-	mptcp_debug("ytxing: tp:%p (meta_tp) reward:%llu active_reward:%llu\n", meta_tp, reward, active_reward);
+	mptcp_debug("ytxing: tp:%p (meta_tp) reward:%llu active_reward:%llu\n", meta_tp, reward >> 3, active_reward >> 3);
 	reward = active_reward;
 	
 	ol_check_reward_difference(reward, meta_sk);
@@ -1203,7 +1203,7 @@ static void ol_process_all_subflows(struct sock *meta_sk, bool *new_interval_sta
 			interval_duration = meta_interval->interval_duration;
 
 			meta_interval->snd_ended = true;
-			mptcp_debug("ytxing: tp:%p (meta:%d) SND END packets_sent:%u\n", meta_tp, is_meta_tp(meta_tp), packets_sent);
+			// mptcp_debug("ytxing: tp:%p (meta:%d) SND END packets_sent:%u\n", meta_tp, is_meta_tp(meta_tp), packets_sent);
 		}
 	}
 	
@@ -1719,7 +1719,7 @@ static struct mptcp_sched_ops mptcp_sched_ol = {
 	.next_segment = mptcp_ol_next_segment_rtt,
 	.init = ol_init,
 	.release = ol_release,
-	.name = "olucb",
+	.name = "ol",
 	.owner = THIS_MODULE,
 };
 
