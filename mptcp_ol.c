@@ -55,15 +55,23 @@ static bool DEBUG_USE_UCB __read_mostly = true;
 module_param(DEBUG_USE_UCB, bool, 0644);	/*模块参数类型，权限*/
 MODULE_PARM_DESC(DEBUG_USE_UCB, "if true, use UCB; else use Exp3");	/*模块参数说明*/
 
+static bool DEBUG_USE_UCB_MON __read_mostly = true; 
+module_param(DEBUG_USE_UCB_MON, bool, 0644);	/*模块参数类型，权限*/
+MODULE_PARM_DESC(DEBUG_USE_UCB_MON, "use UCB reward monitor?");	/*模块参数说明*/
+
+static bool DEBUG_USE_ACT_RWD __read_mostly = true; 
+module_param(DEBUG_USE_ACT_RWD, bool, 0644);	/*模块参数类型，权限*/
+MODULE_PARM_DESC(DEBUG_USE_ACT_RWD, "if true, activate the reward");	/*模块参数说明*/
+
 #define DEBUG_USE_FORCE_DECOUPLE false
 
 #define OLSCHED_INTERVALS_NUM 1
-#define OLSCHED_INTERVALS_MIN_DURATION 20 * USEC_PER_MSEC /* minimal duration(us) */
+#define OLSCHED_INTERVALS_MIN_DURATION 40 * USEC_PER_MSEC /* minimal duration(us) */
 
 /* ytxing:
  * tried 3/2, it seems that longer duration is better.
  */
-#define OLSCHED_INTERVALS_DURATION_N_RTT 5/2 /* n * RTT */
+#define OLSCHED_INTERVALS_DURATION_N_RTT (4/2) /* n * RTT */
 #define OLSCHED_INTERVALS_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 3
 #define OLSCHED_DCP_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 100 /* a timeout for decoupled bandwidth */
 #define OLSCHED_MAX_BWD_TIMEOUT OLSCHED_INTERVALS_MIN_DURATION * 100 /* a timeout for decoupled bandwidth */
@@ -319,9 +327,13 @@ static u64 ol_exp(u32 x)
 /* get x = number * OLSCHED_UNIT, return (e^b(number-1)*OLSCHED_UNIT */
 static u64 ol_activate_reward(u64 x)
 {
+
 	u64 e_bx;
 	u64 e_b;
 	u64 b = OLSCHED_ACTIVATION_B;
+	if (! DEBUG_USE_ACT_RWD) {
+		return x;
+	}
 	e_bx = ol_exp(b * x);
 	e_b = ol_exp(b * OLSCHED_UNIT);
 	e_bx *= OLSCHED_UNIT;
@@ -918,6 +930,124 @@ static u64 ol_calc_reward(struct sock *meta_sk) {
 }
 
 /* TODO if the direction of the outsiders is the same as this arm, do not reset */
+void ol_check_reward_difference_UCB1(u64 curr_reward, struct sock *meta_sk)
+{
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
+	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
+	struct ol_gambler *gambler = ol_cb->gambler;
+	struct ol_monitor *monitor = ol_cb->monitor;
+	s64 tmp_mdev;
+	int i;
+	bool outsider = false;
+	bool is_best = true, is_worst = true;
+	int arm_idx = gambler->previous_arm_idx;
+	u64 avg_reward = gambler->arm_avg_reward[arm_idx];
+
+	if (monitor->epoch_duration > 0)
+		monitor->epoch_duration --;
+
+	for (i = 0; i < OLSCHED_ARMS_NUM; i++){
+		is_best = is_best && (avg_reward >= gambler->arm_avg_reward[i]);
+		is_worst = is_worst && (avg_reward <= gambler->arm_avg_reward[i]);
+	}
+	
+	tmp_mdev = curr_reward - avg_reward;
+
+	if (monitor->arm_reward_mdev[arm_idx] == 0){
+		monitor->arm_reward_mdev[arm_idx] = abs(tmp_mdev);
+		mptcp_debug("ytxing: tp:%p (meta_tp) MON idx:%d curr_reward:%llu avg_reward[%d]:%llu %d * arm_reward_mdev:%llu changing_count:%d\n",\
+		meta_tp, arm_idx, curr_reward >> 3, arm_idx, avg_reward >> 3, OLSCHED_MDEV_MUL, monitor->arm_reward_mdev[arm_idx] >> 3, monitor->changing_count[arm_idx]);
+		return;
+	}
+
+	/* check different_reward */
+	if ((curr_reward > avg_reward +  monitor->arm_reward_mdev[arm_idx] * OLSCHED_MDEV_MUL) && !is_best){ 
+		/* get higher reward, if this arm is not the best, update */
+		if (monitor->changing_count[arm_idx] <= 0){
+			monitor->changing_count[arm_idx] = 0;
+		}
+		monitor->changing_count[arm_idx] ++;
+		outsider = true;
+	}
+	else if ((curr_reward < max_t(s64, avg_reward - monitor->arm_reward_mdev[arm_idx] * OLSCHED_MDEV_MUL, 0)) && !is_worst){
+		/* get lower reward, if this arm is not the worst, update  */
+		if (monitor->changing_count[arm_idx] >= 0){
+			monitor->changing_count[arm_idx] = 0;
+		}
+		monitor->changing_count[arm_idx] --;
+		outsider = true;
+	}
+	else /* in normal range, changing count set to zero*/
+	{
+		monitor->changing_count[arm_idx] = 0;
+	}
+
+	mptcp_debug("ytxing: tp:%p (meta_tp) MON idx:%d curr_reward:%llu avg_reward[%d]:%llu %d * arm_reward_mdev:%llu changing_count:%d epoch:%u\n",\
+	meta_tp, arm_idx, curr_reward >> 3, arm_idx, avg_reward >> 3, OLSCHED_MDEV_MUL, monitor->arm_reward_mdev[arm_idx] >> 3, monitor->changing_count[arm_idx], monitor->epoch_duration);
+
+	if (abs(monitor->changing_count[arm_idx]) >= OLSCHED_CHANGING_THR){
+		// monitor->state = OL_CHANGE;
+		mptcp_debug("ytxing: tp:%p (meta_tp) MON exceed threshold changing_count:%d\n", meta_tp, monitor->changing_count[arm_idx]);
+
+		/* reset the weight of each arm */
+		if (DEBUG_USE_UCB_MON){
+			mptcp_debug("ytxing: tp:%p (meta_tp) MON new epoch, reset average reward and count\n", meta_tp);
+			for (i = 0; i < OLSCHED_ARMS_NUM; i++){
+				gambler->arm_count[i] = 0;
+				gambler->arm_count_total = 0;
+				gambler->arm_avg_reward[i] = 0;
+			}
+			monitor->changing_count[arm_idx] = 0;
+			gambler->arm_count[arm_idx] ++;
+			gambler->arm_count_total ++;
+			monitor->epoch_duration = OLSCHED_EPOCH_DURATION;
+		}
+	}
+
+
+	if (outsider && monitor->epoch_duration == 0){ /* if so, do not update */
+		mptcp_debug("ytxing: tp:%p (meta_tp) MON ignore an outsider\n", meta_tp);
+		return;
+	}
+
+	monitor->arm_reward_mdev[arm_idx] = monitor->arm_reward_mdev[arm_idx] - (monitor->arm_reward_mdev[arm_idx] >> 3) + (abs(tmp_mdev) >> 3);
+
+}
+
+/* The UCB1 Algorithm: 
+ * 0. pull each arm once
+ * 1. pull the arm i with the highest UCB of each arm (ol_get_UCB)
+ * 2. get reward, update the arm_avg_reward of that arm i
+ *
+ *              0->1->2->1->2->1->2...
+ * initialization | in this function
+ *
+ * this function update the MAB model
+ */
+static void ol_update_UCB1(struct sock *meta_sk)
+{
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
+	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
+	struct ol_gambler *gambler = ol_cb->gambler;
+	u64 avg_reward, curr_reward;
+	gambler->previous_arm_idx = gambler->current_arm_idx;
+
+	// TODO Maybe activate the curr_reward?
+	curr_reward = ol_calc_reward(meta_sk);
+
+	ol_check_reward_difference_UCB1(curr_reward, meta_sk);
+
+	/* update the average reward of this arm */
+	avg_reward = gambler->arm_avg_reward[gambler->previous_arm_idx];
+	avg_reward *= gambler->arm_count[gambler->previous_arm_idx] - 1; // current pulling action is counted, thus minus one.
+	avg_reward += curr_reward; // reward << OLSCHED_SCALE, actually. Since 0 < reward <= 1. 
+	do_div(avg_reward, gambler->arm_count[gambler->previous_arm_idx]);
+	gambler->arm_avg_reward[gambler->previous_arm_idx] = avg_reward;
+	
+	mptcp_debug("ytxing: tp:%p (meta_tp) idx:%d curr_reward:%llu avg_reward:%llu\n", meta_tp, gambler->previous_arm_idx, curr_reward >> 3, avg_reward >> 3);
+}
+
+/* TODO if the direction of the outsiders is the same as this arm, do not reset */
 void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 {	
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
@@ -1017,34 +1147,6 @@ void ol_check_reward_difference(u64 curr_reward, struct sock *meta_sk)
 	return;
 }
 
-/* The UCB1 Algorithm: 
- * 0. pull each arm once
- * 1. pull the arm i with the highest UCB of each arm (ol_get_UCB)
- * 2. get reward, update the arm_avg_reward of that arm i
- *
- *              0->1->2->1->2->1->2...
- * initialization | in this function
- *
- * this function update the MAB model
- */
-static void ol_update_UCB1(struct sock *meta_sk)
-{
-	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
-	struct ol_cb *ol_cb = ol_get_cb(meta_tp);
-	struct ol_gambler *gambler = ol_cb->gambler;
-	u64 avg_reward, curr_reward;
-	gambler->previous_arm_idx = gambler->current_arm_idx;
-	/* update the average reward of this arm */
-	avg_reward = gambler->arm_avg_reward[gambler->previous_arm_idx];
-	avg_reward *= gambler->arm_count[gambler->previous_arm_idx] - 1; // current pulling action is counted, thus minus one.
-	// TODO Maybe activate the curr_reward?
-	curr_reward = ol_calc_reward(meta_sk);
-	avg_reward += curr_reward; // reward << OLSCHED_SCALE, actually. Since 0 < reward <= 1. 
-	do_div(avg_reward, gambler->arm_count[gambler->previous_arm_idx]);
-	gambler->arm_avg_reward[gambler->previous_arm_idx] = avg_reward;
-	
-	mptcp_debug("ytxing: tp:%p (meta_tp) idx:%d curr_reward:%llu avg_reward:%llu\n", meta_tp, gambler->previous_arm_idx, curr_reward >> 3, avg_reward >> 3);
-}
 
 /* The Exp3 Algorithm: 
  * 1. set arm probability according to arm weight
